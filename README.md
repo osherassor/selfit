@@ -1,4 +1,4 @@
-# 🌐 Web Discovery Scanner - Enhanced Version
+# 🌐 Web Discovery Scanner - Selfit
 
 A powerful, feature-rich web service discovery and analysis tool designed for security professionals, penetration testers, and network administrators. This tool provides comprehensive web service enumeration with advanced features like SSL certificate analysis, subdomain discovery, path fuzzing, and automated screenshot capture.
 
