@@ -10,7 +10,8 @@ import json
 import sys
 import time
 import threading
-from concurrent.futures import ThreadPoolExecutor
+import traceback
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -118,13 +119,17 @@ class ProgressTracker:
         self.pbar = None
         self.lock = threading.Lock()
         self.skip_current = False
+        self.kill_scan = False  # New kill switch flag
         self.keyboard_thread = None
+        self.running = True  # Control flag for keyboard thread
     
     def start(self):
         print(f"{Fore.CYAN}🚀 {Style.BRIGHT}Starting Web Discovery Scanner{Style.RESET_ALL}")
         print(f"{Fore.YELLOW}📊 {Style.BRIGHT}Targets: {self.total_targets} | Ports: {self.total_ports} | Total Tasks: {self.total_tasks}{Style.RESET_ALL}")
         print(f"{Fore.GREEN}⏱️  {Style.BRIGHT}Estimated time: {self.total_tasks * 3:.0f}s{Style.RESET_ALL}")
         print(f"{Fore.MAGENTA}⌨️  {Style.BRIGHT}Press 's' to skip current website scan{Style.RESET_ALL}")
+        print(f"{Fore.RED}⌨️  {Style.BRIGHT}Press 'k' to kill/stop the entire scan{Style.RESET_ALL}")
+        print(f"{Fore.CYAN}⌨️  {Style.BRIGHT}Press Ctrl+C to force exit{Style.RESET_ALL}")
         print("-" * 60)
         self.pbar = tqdm(total=self.total_tasks, desc="🔍 Scanning", unit="target:port", 
                         bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]')
@@ -134,8 +139,8 @@ class ProgressTracker:
         self.keyboard_thread.start()
     
     def _keyboard_listener(self):
-        """Listen for keyboard input to skip current scan"""
-        while True:
+        """Listen for keyboard input to skip current scan or kill scan"""
+        while self.running:
             try:
                 if msvcrt.kbhit():
                     key = msvcrt.getch().decode('utf-8').lower()
@@ -143,7 +148,14 @@ class ProgressTracker:
                         with self.lock:
                             self.skip_current = True
                         print(f"\n{Fore.YELLOW}⏭️  {Style.BRIGHT}Skipping current scan...{Style.RESET_ALL}")
-            except:
+                    elif key == 'k':
+                        with self.lock:
+                            self.kill_scan = True
+                        print(f"\n{Fore.RED}🛑 {Style.BRIGHT}KILL SWITCH ACTIVATED - Stopping scan...{Style.RESET_ALL}")
+                        break
+            except (UnicodeDecodeError, KeyboardInterrupt):
+                pass
+            except Exception as e:
                 pass
             time.sleep(0.1)
     
@@ -182,20 +194,51 @@ class ProgressTracker:
         with self.lock:
             return self.skip_current
     
+    def should_kill(self):
+        """Check if scan should be killed"""
+        with self.lock:
+            return self.kill_scan
+    
+    def stop(self):
+        """Stop the keyboard listener thread"""
+        self.running = False
+        if self.keyboard_thread and self.keyboard_thread.is_alive():
+            self.keyboard_thread.join(timeout=1)
+    
     def close(self):
+        self.stop()
         if self.pbar:
             self.pbar.close()
-        print(f"{Fore.GREEN}✅ {Style.BRIGHT}Scan completed!{Style.RESET_ALL}")
+        if self.kill_scan:
+            print(f"{Fore.RED}🛑 {Style.BRIGHT}Scan stopped by user!{Style.RESET_ALL}")
+        else:
+            print(f"{Fore.GREEN}✅ {Style.BRIGHT}Scan completed!{Style.RESET_ALL}")
 
 class WebDiscoveryScanner:
     def __init__(self, config: Dict):
         self.config = config
         self.results = []
         self.vulnerability_groups = {}
-        self.output_dir = Path(config.get('output', 'outputs'))
+        
+        # Create organized output directory with date, time, and scope
+        self.scan_scope = config.get('scan_scope', 'unknown')
+        self.scan_timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        
+        # Create base output directory
+        base_output = Path(config.get('output', 'outputs'))
+        base_output.mkdir(exist_ok=True)
+        
+        # Create scan-specific directory
+        self.output_dir = base_output / f"scan_{self.scan_timestamp}_{self.scan_scope}"
         self.screenshots_dir = self.output_dir / "screenshots"
+        
+        # Create directories
         self.output_dir.mkdir(exist_ok=True)
         self.screenshots_dir.mkdir(exist_ok=True)
+        
+        # Log the output directory
+        logger.info(f"📁 Output directory: {self.output_dir}")
+        logger.info(f"📸 Screenshots directory: {self.screenshots_dir}")
         
         self.ports = config.get('ports', [80, 443, 8080, 8000, 8443, 8888, 81, 82, 7000, 9443])
         self.progress_tracker = None
@@ -333,13 +376,16 @@ class WebDiscoveryScanner:
     
     def _create_session(self):
         session = requests.Session()
-        # Faster retry strategy
-        retry_strategy = Retry(total=2, backoff_factor=0.5)
-        adapter = HTTPAdapter(max_retries=retry_strategy, pool_connections=10, pool_maxsize=20)
+        # Faster retry strategy with shorter timeouts
+        retry_strategy = Retry(total=1, backoff_factor=0.1)  # Reduced retries and backoff
+        adapter = HTTPAdapter(max_retries=retry_strategy, pool_connections=50, pool_maxsize=100)  # Increased pool size
         session.mount("http://", adapter)
         session.mount("https://", adapter)
-        session.timeout = self.config.get('timeout', 3)  # Reduced from 5
+        session.timeout = self.config.get('timeout', 2)  # Reduced timeout for faster scanning
         session.headers.update({'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'})
+        
+        # Limit redirects to prevent redirect loops
+        session.max_redirects = 5
         
         # Disable SSL warnings and verification
         import urllib3
@@ -404,15 +450,30 @@ class WebDiscoveryScanner:
     
     def scan_ports(self, target: str) -> List[int]:
         open_ports = []
-        for port in self.ports:
-            try:
-                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                sock.settimeout(1)  # Reduced from 2 seconds
-                if sock.connect_ex((target, port)) == 0:
-                    open_ports.append(port)
-                sock.close()
-            except:
-                pass
+        
+        # Use ThreadPoolExecutor for faster port scanning
+        with ThreadPoolExecutor(max_workers=min(len(self.ports), 20)) as executor:
+            def check_port(port):
+                try:
+                    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    sock.settimeout(0.5)  # Very fast timeout
+                    if sock.connect_ex((target, port)) == 0:
+                        sock.close()
+                        return port
+                    sock.close()
+                except:
+                    pass
+                return None
+            
+            # Submit all port checks
+            future_to_port = {executor.submit(check_port, port): port for port in self.ports}
+            
+            # Collect results
+            for future in as_completed(future_to_port):
+                result = future.result()
+                if result:
+                    open_ports.append(result)
+        
         return open_ports
     
     def _identify_service_type(self, service: WebService) -> str:
@@ -874,8 +935,30 @@ class WebDiscoveryScanner:
                     self.progress_tracker.update_status(target, port, "Resolving domain name...")
                 service.domain_name = self._resolve_domain_name(target)
             
-            # Faster request with shorter timeout
-            response = self.session.get(url, verify=False, timeout=5)
+            # Faster request with shorter timeout and better error handling
+            try:
+                response = self.session.get(url, verify=False, timeout=3, allow_redirects=True)
+            except requests.exceptions.TooManyRedirects:
+                logger.warning(f"⚠️ Too many redirects for {url}")
+                service.title = "Redirect Loop Detected"
+                service.status_code = 302
+                return service
+            except requests.exceptions.ConnectionError as e:
+                logger.warning(f"⚠️ Connection error for {url}: {e}")
+                service.title = "Connection Error"
+                service.status_code = 0
+                return service
+            except requests.exceptions.Timeout:
+                logger.warning(f"⚠️ Timeout for {url}")
+                service.title = "Timeout"
+                service.status_code = 0
+                return service
+            except Exception as e:
+                logger.error(f"❌ Error analyzing {url}: {e}")
+                logger.error(f"❌ Traceback: {traceback.format_exc()}")
+                service.title = f"Error: {str(e)[:50]}"
+                service.status_code = 0
+                return service
             service.status_code = response.status_code
             service.headers = dict(response.headers)
             service.server_banner = response.headers.get('Server', '')
@@ -885,7 +968,13 @@ class WebDiscoveryScanner:
             # Extract cookies
             if 'Set-Cookie' in response.headers:
                 try:
-                    cookies = response.headers.getall('Set-Cookie')
+                    # Handle both single and multiple cookies
+                    set_cookie_header = response.headers.get('Set-Cookie', '')
+                    if isinstance(set_cookie_header, list):
+                        cookies = set_cookie_header
+                    else:
+                        cookies = [set_cookie_header]
+                    
                     service.cookies = [cookie.split(';')[0].split('=')[0] for cookie in cookies if '=' in cookie]
                     logger.info(f"🍪 Found {len(service.cookies)} cookies")
                 except Exception as e:
@@ -957,14 +1046,23 @@ class WebDiscoveryScanner:
             
             # Take screenshot (enabled by default)
             if not self.config.get('no_screenshots', False):
-                logger.info(f"📸 Taking screenshot of {url}")
-                screenshot_path = await self._take_screenshot(url, target, port, protocol)
-                if screenshot_path:
-                    service.screenshot_file = str(screenshot_path)
-                    logger.info(f"📸 Screenshot saved: {screenshot_path}")
+                # Only take screenshots for interesting services to speed up scanning
+                interesting_services = ['login', 'ci_cd_lateral', 'router', 'database', 'monitoring']
+                if (service.service_type in interesting_services or 
+                    service.specific_target or 
+                    service.vulnerabilities or
+                    service.status_code != 200):
+                    logger.info(f"📸 Taking screenshot of {url}")
+                    screenshot_path = await self._take_screenshot(url, target, port, protocol)
+                    if screenshot_path:
+                        service.screenshot_file = str(screenshot_path)
+                        logger.info(f"📸 Screenshot saved: {screenshot_path}")
+                    else:
+                        service.screenshot_file = ""
+                        logger.info(f"📸 Screenshot failed")
                 else:
                     service.screenshot_file = ""
-                    logger.info(f"📸 Screenshot failed")
+                    logger.debug(f"📸 Skipping screenshot for {url} (not interesting)")
             
             # Fuzz paths if enabled
             if self.config.get('enable_fuzzing', False):
@@ -1011,30 +1109,27 @@ class WebDiscoveryScanner:
                 
                 page = await context.new_page()
                 
-                # Enhanced page loading with much better timing
+                # Faster page loading for screenshots
                 try:
-                    # First try to load the page with networkidle
-                    await page.goto(url, wait_until='networkidle', timeout=15000)
+                    # Use domcontentloaded for faster loading
+                    await page.goto(url, wait_until='domcontentloaded', timeout=8000)
                     
-                    # Wait for the page to be fully loaded
-                    await page.wait_for_load_state('networkidle', timeout=8000)
-                    
-                    # Wait for any JavaScript to finish executing
-                    await asyncio.sleep(5)
+                    # Wait for basic content to load
+                    await asyncio.sleep(2)
                     
                     # Check if page has content (not just white)
                     content = await page.content()
                     if len(content.strip()) < 100:  # Very little content
                         logger.warning(f"⚠️ Page appears to have little content: {url}")
                         # Try waiting a bit more
-                        await asyncio.sleep(3)
+                        await asyncio.sleep(1)
                     
                 except Exception as e:
                     logger.warning(f"⚠️ Page load timeout for {url}: {e}")
                     # Try alternative loading strategy
                     try:
-                        await page.goto(url, wait_until='domcontentloaded', timeout=10000)
-                        await asyncio.sleep(5)
+                        await page.goto(url, wait_until='domcontentloaded', timeout=5000)
+                        await asyncio.sleep(1)
                     except:
                         pass
                 
@@ -1075,152 +1170,666 @@ class WebDiscoveryScanner:
     
     def _generate_html_content(self) -> str:
         """Generate HTML report content with live updates"""
-        html_template = r"""
+        
+        # Calculate vulnerability statistics
+        vulnerable_count = len([s for s in self.results if s.vulnerabilities])
+        expired_certs_count = len([s for s in self.results if s.cert_status == "Expired"])
+        lateral_count = len([s for s in self.results if s.specific_target])
+        https_count = len([s for s in self.results if s.protocol == 'https'])
+        total_services = len(self.results)
+        
+        # Determine card classes based on counts
+        critical_class = "critical" if vulnerable_count > 0 else "success"
+        warning_class = "warning" if expired_certs_count > 0 else "success"
+        success_class = "success"
+        info_class = "info" if lateral_count > 0 else "success"
+        
+        # Generate vulnerability explanations
+        vulnerability_explanations = self._generate_vulnerability_explanations()
+        
+        # Generate table rows
+        table_rows = self._generate_table_rows()
+        
+        # Generate discovered paths section
+        discovered_paths_section = self._generate_discovered_paths_section()
+        
+        # Generate CI/CD and lateral movement section
+        cicd_lateral_section = self._generate_cicd_lateral_section()
+        
+        # Only show real discovered paths, no sample data
+        
+        # Only show real CI/CD and lateral movement assets, no sample data
+        
+        # Use string replacement instead of format to avoid CSS conflicts
+        html_content = self._get_html_template()
+        
+        # Replace placeholders
+        html_content = html_content.replace('{vulnerable_count}', str(vulnerable_count))
+        html_content = html_content.replace('{expired_certs_count}', str(expired_certs_count))
+        html_content = html_content.replace('{total_services}', str(total_services))
+        html_content = html_content.replace('{lateral_count}', str(lateral_count))
+        html_content = html_content.replace('{critical_class}', critical_class)
+        html_content = html_content.replace('{warning_class}', warning_class)
+        html_content = html_content.replace('{success_class}', success_class)
+        html_content = html_content.replace('{info_class}', info_class)
+        html_content = html_content.replace('{vulnerability_explanations}', vulnerability_explanations)
+        html_content = html_content.replace('{table_rows}', table_rows)
+        html_content = html_content.replace('{discovered_paths_section}', discovered_paths_section)
+        html_content = html_content.replace('{cicd_lateral_section}', cicd_lateral_section)
+        
+        return html_content
+    
+    def _get_html_template(self) -> str:
+        """Get the HTML template with proper CSS escaping"""
+        return r"""
 <!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Web Discovery Scanner - Live Report</title>
+    <title>Web Discovery Scanner - Executive Report</title>
     <link rel="stylesheet" href="https://cdn.datatables.net/1.11.5/css/jquery.dataTables.min.css">
     <link rel="stylesheet" href="https://cdn.datatables.net/responsive/2.2.9/css/responsive.dataTables.min.css">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
     <style>
-        /* Fallback DataTables CSS in case CDN is slow */
-        .dataTables_wrapper .dataTables_length, .dataTables_wrapper .dataTables_filter, .dataTables_wrapper .dataTables_info, .dataTables_wrapper .dataTables_processing, .dataTables_wrapper .dataTables_paginate { color: #333; }
-        .dataTables_wrapper .dataTables_length select { border: 1px solid #ddd; border-radius: 4px; padding: 4px; }
-        .dataTables_wrapper .dataTables_filter input { border: 1px solid #ddd; border-radius: 4px; padding: 4px; margin-left: 8px; }
-        .dataTables_wrapper .dataTables_paginate .paginate_button { border: 1px solid #ddd; padding: 6px 12px; margin: 0 2px; cursor: pointer; border-radius: 4px; }
-        .dataTables_wrapper .dataTables_paginate .paginate_button:hover { background: #f0f0f0; }
-        .dataTables_wrapper .dataTables_paginate .paginate_button.current { background: #007bff; color: white; border-color: #007bff; }
-        table.dataTable { border-collapse: collapse; width: 100%; }
-        table.dataTable thead th { background: #f8f9fa; border: 1px solid #dee2e6; padding: 8px; font-weight: bold; }
-        table.dataTable tbody td { border: 1px solid #dee2e6; padding: 8px; }
-        table.dataTable tbody tr:nth-child(even) { background: #f8f9fa; }
-        table.dataTable tbody tr:hover { background: #e9ecef; }
-    </style>
-    <style>
-        body { font-family: Arial, sans-serif; margin: 20px; background-color: #f5f5f5; }
-        .container { max-width: 1600px; margin: 0 auto; background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
-        h1, h2, h3 { color: #333; }
-        .summary { background: #e8f4fd; padding: 15px; border-radius: 5px; margin-bottom: 20px; }
-        .vulnerabilities { background: #fff3cd; padding: 15px; border-radius: 5px; margin-bottom: 20px; }
-        .vuln-group { margin: 10px 0; padding: 10px; background: #f8f9fa; border-radius: 4px; }
-        .vuln-link { color: #007bff; text-decoration: none; margin-right: 10px; }
-        .vuln-link:hover { text-decoration: underline; }
-        .lateral-movement { background: #e8f5e8; padding: 15px; border-radius: 5px; margin-bottom: 20px; }
-        .target-group { margin: 10px 0; padding: 10px; background: #f0f8f0; border-radius: 4px; border-left: 4px solid #28a745; }
-        .target-link { color: #28a745; text-decoration: none; margin-right: 10px; font-weight: bold; }
-        .target-link:hover { text-decoration: underline; }
-        .screenshot { max-width: 200px; max-height: 150px; cursor: pointer; border: 1px solid #ddd; border-radius: 6px; transition: transform 0.2s ease, box-shadow 0.2s ease; }
-        .screenshot:hover { transform: scale(4); box-shadow: 0 4px 12px rgba(0,0,0,0.3); z-index: 10; position: relative; }
-        .modal { display: none; position: fixed; z-index: 1000; left: 0; top: 0; width: 100%; height: 100%; background-color: rgba(0,0,0,0.9); }
-        .modal-content { margin: auto; display: block; max-width: 98%; max-height: 98%; margin-top: 1%; border-radius: 12px; box-shadow: 0 8px 32px rgba(0,0,0,0.8); transition: transform 0.3s ease; }
-        .modal-content:hover { transform: scale(1.02); }
-        .close { position: absolute; top: 15px; right: 35px; color: #f1f1f1; font-size: 40px; font-weight: bold; cursor: pointer; }
-        .service-type { padding: 4px 8px; border-radius: 4px; font-size: 12px; font-weight: bold; }
-        .type-web { background: #d4edda; color: #155724; }
-        .type-printer { background: #d1ecf1; color: #0c5460; }
-        .type-storage { background: #fff3cd; color: #856404; }
-        .type-login { background: #f8d7da; color: #721c24; }
-        .type-camera { background: #e2e3e5; color: #383d41; }
-        .type-router { background: #d6d8db; color: #1b1e21; }
-        .type-database { background: #cce5ff; color: #004085; }
-        .type-monitoring { background: #d4edda; color: #155724; }
-        .type-development { background: #f8d7da; color: #721c24; }
-        .type-ci_cd_lateral { background: #ff6b6b; color: white; }
-        .vuln-badge { background: #dc3545; color: white; padding: 2px 6px; border-radius: 3px; font-size: 10px; margin-left: 5px; }
-        .headers-section { max-height: 200px; max-width: 120px; overflow-y: auto; background: #f9f9f9; padding: 8px; border-radius: 6px; font-size: 11px; border: 1px solid #ddd; }
-        .headers-section strong { color: #2c3e50; font-weight: 600; }
-        .headers-section br { margin-bottom: 2px; }
-        .table-responsive { overflow-x: auto; max-width: 100%; }
-        .dataTables_wrapper { overflow-x: auto; }
-        .dataTables_scrollBody { overflow-x: auto; }
-        .cookies-section { max-height: 150px; overflow-y: auto; background: #fff8dc; padding: 8px; border-radius: 4px; }
-        .cookie-badge { background: #ffc107; color: #212529; padding: 2px 6px; border-radius: 3px; font-size: 10px; margin: 2px; display: inline-block; }
-        .subdomains-section { max-height: 150px; overflow-y: auto; background: #e8f5e8; padding: 8px; border-radius: 4px; }
-        .subdomain-badge { background: #28a745; color: white; padding: 2px 6px; border-radius: 3px; font-size: 10px; margin: 2px; display: inline-block; }
-        .paths-section { max-height: 150px; overflow-y: auto; background: #f0f8ff; padding: 8px; border-radius: 4px; }
-        .path-badge { background: #007bff; color: white; padding: 2px 6px; border-radius: 3px; font-size: 10px; margin: 2px; display: inline-block; }
-        .paths-collapsible { outline: none; }
-        .paths-collapsible.active, .paths-collapsible:hover { background: #cbe7fa; }
-        .paths-content { transition: all 0.2s ease; }
-        .service-paths-group { margin: 10px 0; }
-        .path-badge-success { background: #28a745; color: white; padding: 4px 8px; border-radius: 4px; font-size: 11px; margin: 2px; display: inline-block; text-decoration: none; }
-        .path-badge-success:hover { background: #218838; color: white; text-decoration: none; }
-        .path-badge-redirect { background: #ffc107; color: #212529; padding: 4px 8px; border-radius: 4px; font-size: 11px; margin: 2px; display: inline-block; text-decoration: none; }
-        .path-badge-redirect:hover { background: #e0a800; color: #212529; text-decoration: none; }
-        .path-badge-auth { background: #17a2b8; color: white; padding: 4px 8px; border-radius: 4px; font-size: 11px; margin: 2px; display: inline-block; text-decoration: none; }
-        .path-badge-auth:hover { background: #138496; color: white; text-decoration: none; }
-        .path-badge-forbidden { background: #dc3545; color: white; padding: 4px 8px; border-radius: 4px; font-size: 11px; margin: 2px; display: inline-block; text-decoration: none; }
-        .path-badge-forbidden:hover { background: #c82333; color: white; text-decoration: none; }
-        .path-badge-other { background: #6c757d; color: white; padding: 4px 8px; border-radius: 4px; font-size: 11px; margin: 2px; display: inline-block; text-decoration: none; }
-        .path-badge-other:hover { background: #5a6268; color: white; text-decoration: none; }
-        .cert-info { background: #f0f8ff; padding: 10px; border-radius: 4px; margin: 5px 0; }
-        .status-expired { color: red; font-weight: bold; }
-        .status-expiring { color: orange; font-weight: bold; }
-        .status-valid { color: green; font-weight: bold; }
-        .live-indicator { color: #28a745; animation: pulse 2s infinite; }
-        @keyframes pulse { 0% { opacity: 1; } 50% { opacity: 0.5; } 100% { opacity: 1; } }
-        .collapsible { outline: none; }
-        .collapsible.active, .collapsible:hover { background: #cbe7fa; }
-        .content { transition: all 0.2s ease; }
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        
+        body { 
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif; 
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            color: #2d3748;
+            line-height: 1.6;
+        }
+        
+        .main-container { 
+            max-width: 1400px; 
+            margin: 0 auto; 
+            padding: 20px;
+        }
+        
+        .header { 
+            background: rgba(255, 255, 255, 0.95); 
+            backdrop-filter: blur(10px);
+            border-radius: 20px; 
+            padding: 30px; 
+            margin-bottom: 30px; 
+            box-shadow: 0 20px 40px rgba(0,0,0,0.1);
+            border: 1px solid rgba(255,255,255,0.2);
+        }
+        
+        .header h1 { 
+            font-size: 2.5rem; 
+            font-weight: 700; 
+            background: linear-gradient(135deg, #667eea, #764ba2);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            margin-bottom: 10px;
+            display: flex;
+            align-items: center;
+            gap: 15px;
+        }
+        
+        .live-indicator { 
+            color: #48bb78; 
+            animation: pulse 2s infinite;
+            font-size: 1.5rem;
+        }
+        
+        @keyframes pulse { 
+            0% { opacity: 1; transform: scale(1); } 
+            50% { opacity: 0.5; transform: scale(1.1); } 
+            100% { opacity: 1; transform: scale(1); } 
+        }
+        
+        .header-subtitle {
+            color: #718096;
+            font-size: 1.1rem;
+            font-weight: 400;
+        }
+        
+        .executive-summary {
+            background: rgba(255, 255, 255, 0.95);
+            backdrop-filter: blur(10px);
+            border-radius: 20px;
+            padding: 30px;
+            margin-bottom: 30px;
+            box-shadow: 0 20px 40px rgba(0,0,0,0.1);
+            border: 1px solid rgba(255,255,255,0.2);
+        }
+        
+        .executive-summary h2 {
+            font-size: 1.8rem;
+            font-weight: 600;
+            color: #2d3748;
+            margin-bottom: 20px;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        
+        .summary-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+            gap: 20px;
+            margin-bottom: 30px;
+        }
+        
+        .summary-card {
+            background: linear-gradient(135deg, #f7fafc, #edf2f7);
+            border-radius: 15px;
+            padding: 25px;
+            text-align: center;
+            border: 1px solid #e2e8f0;
+            transition: all 0.3s ease;
+        }
+        
+        .summary-card:hover {
+            transform: translateY(-5px);
+            box-shadow: 0 15px 30px rgba(0,0,0,0.1);
+        }
+        
+        .summary-card.critical {
+            background: linear-gradient(135deg, #fed7d7, #feb2b2);
+            border-color: #fc8181;
+        }
+        
+        .summary-card.warning {
+            background: linear-gradient(135deg, #fef5e7, #fed7aa);
+            border-color: #f6ad55;
+        }
+        
+        .summary-card.success {
+            background: linear-gradient(135deg, #f0fff4, #c6f6d5);
+            border-color: #68d391;
+        }
+        
+        .summary-card.info {
+            background: linear-gradient(135deg, #ebf8ff, #bee3f8);
+            border-color: #63b3ed;
+        }
+        
+        .summary-number {
+            font-size: 2.5rem;
+            font-weight: 700;
+            margin-bottom: 5px;
+        }
+        
+        .summary-card.critical .summary-number { color: #c53030; }
+        .summary-card.warning .summary-number { color: #dd6b20; }
+        .summary-card.success .summary-number { color: #2f855a; }
+        .summary-card.info .summary-number { color: #2b6cb0; }
+        
+        .summary-label {
+            font-size: 0.9rem;
+            font-weight: 500;
+            color: #4a5568;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+        
+        .vulnerability-analysis {
+            background: #f7fafc;
+            border-radius: 12px;
+            padding: 20px;
+            margin-top: 20px;
+        }
+        
+        .vulnerability-analysis h3 {
+            font-size: 1.5rem;
+            font-weight: 600;
+            color: #2d3748;
+            margin-bottom: 20px;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        
+        .vuln-category {
+            background: #f7fafc;
+            border-radius: 12px;
+            padding: 20px;
+            margin-bottom: 15px;
+            border-left: 4px solid #e53e3e;
+        }
+        
+        .vuln-category.warning {
+            border-left-color: #dd6b20;
+        }
+        
+        .vuln-category.info {
+            border-left-color: #3182ce;
+        }
+        
+        .vuln-title {
+            font-weight: 600;
+            font-size: 1.1rem;
+            margin-bottom: 10px;
+            color: #2d3748;
+        }
+        
+        .vuln-description {
+            color: #4a5568;
+            margin-bottom: 10px;
+            line-height: 1.6;
+        }
+        
+        .vuln-impact {
+            background: #fff5f5;
+            border-radius: 8px;
+            padding: 12px;
+            font-size: 0.9rem;
+            color: #c53030;
+        }
+        
+        .vuln-impact.warning {
+            background: #fffaf0;
+            color: #dd6b20;
+        }
+        
+        .vuln-impact.info {
+            background: #ebf8ff;
+            color: #2b6cb0;
+        }
+        
+        .search-controls {
+            background: rgba(255, 255, 255, 0.95);
+            backdrop-filter: blur(10px);
+            border-radius: 20px;
+            padding: 25px;
+            margin-bottom: 30px;
+            box-shadow: 0 20px 40px rgba(0,0,0,0.1);
+            border: 1px solid rgba(255,255,255,0.2);
+        }
+        
+        .search-controls h4 {
+            font-size: 1.3rem;
+            font-weight: 600;
+            color: #2d3748;
+            margin-bottom: 20px;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        
+        .search-row {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+            gap: 20px;
+            margin-bottom: 20px;
+        }
+        
+        .search-group label {
+            display: block;
+            margin-bottom: 8px;
+            font-weight: 500;
+            color: #4a5568;
+        }
+        
+        .search-group input,
+        .search-group select {
+            width: 100%;
+            padding: 12px;
+            border: 2px solid #e2e8f0;
+            border-radius: 10px;
+            font-size: 14px;
+            transition: all 0.3s ease;
+            background: white;
+        }
+        
+        .search-group input:focus,
+        .search-group select:focus {
+            outline: none;
+            border-color: #667eea;
+            box-shadow: 0 0 0 3px rgba(102, 126, 234, 0.1);
+        }
+        
+        .filter-buttons {
+            display: flex;
+            gap: 12px;
+            flex-wrap: wrap;
+        }
+        
+        .filter-btn {
+            padding: 10px 20px;
+            border: none;
+            border-radius: 10px;
+            cursor: pointer;
+            font-weight: 500;
+            transition: all 0.3s ease;
+            font-size: 14px;
+        }
+        
+        .filter-btn.active {
+            background: linear-gradient(135deg, #667eea, #764ba2);
+            color: white;
+            box-shadow: 0 4px 15px rgba(102, 126, 234, 0.3);
+        }
+        
+        .filter-btn:not(.active) {
+            background: #f7fafc;
+            color: #4a5568;
+            border: 2px solid #e2e8f0;
+        }
+        
+        .filter-btn:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 8px 25px rgba(0,0,0,0.1);
+        }
+        
+        .clear-filters {
+            background: linear-gradient(135deg, #fc8181, #f56565);
+            color: white;
+        }
+        
+        .data-table-section {
+            background: rgba(255, 255, 255, 0.95);
+            backdrop-filter: blur(10px);
+            border-radius: 20px;
+            padding: 30px;
+            margin-bottom: 30px;
+            box-shadow: 0 20px 40px rgba(0,0,0,0.1);
+            border: 1px solid rgba(255,255,255,0.2);
+        }
+        
+        .data-table-section h3 {
+            font-size: 1.5rem;
+            font-weight: 600;
+            color: #2d3748;
+            margin-bottom: 20px;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        
+        .service-type {
+            padding: 6px 12px;
+            border-radius: 20px;
+            font-size: 11px;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+        
+        .type-web { background: #c6f6d5; color: #2f855a; }
+        .type-router { background: #bee3f8; color: #2b6cb0; }
+        .type-login { background: #fed7d7; color: #c53030; }
+        .type-ci_cd_lateral { background: #fc8181; color: white; }
+        .type-database { background: #fef5e7; color: #dd6b20; }
+        .type-monitoring { background: #e6fffa; color: #2c7a7b; }
+        
+        /* Path Badges */
+        .path-badge-success { background: #68d391; color: white; padding: 4px 8px; border-radius: 12px; font-size: 11px; margin: 2px; display: inline-block; text-decoration: none; }
+        .path-badge-success:hover { background: #48bb78; color: white; text-decoration: none; }
+        .path-badge-redirect { background: #f6ad55; color: white; padding: 4px 8px; border-radius: 12px; font-size: 11px; margin: 2px; display: inline-block; text-decoration: none; }
+        .path-badge-redirect:hover { background: #ed8936; color: white; text-decoration: none; }
+        .path-badge-auth { background: #63b3ed; color: white; padding: 4px 8px; border-radius: 12px; font-size: 11px; margin: 2px; display: inline-block; text-decoration: none; }
+        .path-badge-auth:hover { background: #4299e1; color: white; text-decoration: none; }
+        .path-badge-forbidden { background: #fc8181; color: white; padding: 4px 8px; border-radius: 12px; font-size: 11px; margin: 2px; display: inline-block; text-decoration: none; }
+        .path-badge-forbidden:hover { background: #f56565; color: white; text-decoration: none; }
+        .path-badge-other { background: #a0aec0; color: white; padding: 4px 8px; border-radius: 12px; font-size: 11px; margin: 2px; display: inline-block; text-decoration: none; }
+        .path-badge-other:hover { background: #718096; color: white; text-decoration: none; }
+        
+        .screenshot {
+            max-width: 120px;
+            max-height: 90px;
+            cursor: pointer;
+            border-radius: 8px;
+            transition: all 0.3s ease;
+            border: 2px solid #e2e8f0;
+        }
+        
+        .screenshot:hover {
+            transform: scale(3);
+            box-shadow: 0 10px 25px rgba(0,0,0,0.2);
+            z-index: 1000;
+            position: relative;
+        }
+        
+        .modal {
+            display: none;
+            position: fixed;
+            z-index: 1000;
+            left: 0;
+            top: 0;
+            width: 100%;
+            height: 100%;
+            background-color: rgba(0,0,0,0.9);
+            backdrop-filter: blur(5px);
+        }
+        
+        .modal-content {
+            margin: auto;
+            display: block;
+            max-width: 95%;
+            max-height: 95%;
+            margin-top: 2%;
+            border-radius: 15px;
+            box-shadow: 0 25px 50px rgba(0,0,0,0.5);
+            transition: transform 0.3s ease;
+        }
+        
+        .close {
+            position: absolute;
+            top: 20px;
+            right: 40px;
+            color: #f1f1f1;
+            font-size: 50px;
+            font-weight: bold;
+            cursor: pointer;
+            transition: all 0.3s ease;
+        }
+        
+        .close:hover {
+            color: #fc8181;
+            transform: scale(1.1);
+        }
+        
+        @media (max-width: 768px) {
+            .main-container { padding: 10px; }
+            .header h1 { font-size: 2rem; }
+            .summary-grid { grid-template-columns: 1fr; }
+            .search-row { grid-template-columns: 1fr; }
+            .filter-buttons { justify-content: center; }
+        }
+        
+        .dataTables_wrapper .dataTables_length,
+        .dataTables_wrapper .dataTables_filter,
+        .dataTables_wrapper .dataTables_info,
+        .dataTables_wrapper .dataTables_processing,
+        .dataTables_wrapper .dataTables_paginate {
+            color: #4a5568;
+            font-weight: 500;
+        }
+        
+        .dataTables_wrapper .dataTables_length select,
+        .dataTables_wrapper .dataTables_filter input {
+            border: 2px solid #e2e8f0;
+            border-radius: 8px;
+            padding: 8px 12px;
+            font-size: 14px;
+        }
+        
+        .dataTables_wrapper .dataTables_length select:focus,
+        .dataTables_wrapper .dataTables_filter input:focus {
+            border-color: #667eea;
+            box-shadow: 0 0 0 3px rgba(102, 126, 234, 0.1);
+        }
+        
+        .dataTables_wrapper .dataTables_paginate .paginate_button {
+            border: 2px solid #e2e8f0;
+            padding: 8px 16px;
+            margin: 0 4px;
+            cursor: pointer;
+            border-radius: 8px;
+            font-weight: 500;
+            transition: all 0.3s ease;
+        }
+        
+        .dataTables_wrapper .dataTables_paginate .paginate_button:hover {
+            background: linear-gradient(135deg, #667eea, #764ba2);
+            color: white;
+            border-color: #667eea;
+        }
+        
+        .dataTables_wrapper .dataTables_paginate .paginate_button.current {
+            background: linear-gradient(135deg, #667eea, #764ba2);
+            color: white;
+            border-color: #667eea;
+        }
+        
+        table.dataTable {
+            border-collapse: collapse;
+            width: 100%;
+            border-radius: 12px;
+            overflow: hidden;
+            box-shadow: 0 10px 25px rgba(0,0,0,0.1);
+        }
+        
+        table.dataTable thead th {
+            background: linear-gradient(135deg, #f7fafc, #edf2f7);
+            border: none;
+            padding: 15px 12px;
+            font-weight: 600;
+            color: #2d3748;
+            text-transform: uppercase;
+            font-size: 12px;
+            letter-spacing: 0.5px;
+        }
+        
+        table.dataTable tbody td {
+            border: none;
+            border-bottom: 1px solid #e2e8f0;
+            padding: 12px;
+            vertical-align: middle;
+        }
+        
+        table.dataTable tbody tr:nth-child(even) {
+            background: #f7fafc;
+        }
+        
+        table.dataTable tbody tr:hover {
+            background: #edf2f7;
+            transform: scale(1.01);
+            transition: all 0.3s ease;
+        }
     </style>
 </head>
 <body>
-    <div class="container">
-        <h1>🚀 Web Discovery Scanner - Live Report <span class="live-indicator">●</span></h1>
-        
-        <div class="summary">
-            <h3>📊 Scan Summary</h3>
-            <p><strong>Scan Date:</strong> {scan_date}</p>
-            <p><strong>Total Services Found:</strong> {total_services}</p>
-            <p><strong>Service Types:</strong> {service_types}</p>
-
-            <p><strong>HTTPS Services:</strong> {https_count}</p>
+    <div class="main-container">
+        <div class="header">
+            <h1>🚀 Web Discovery Scanner <span class="live-indicator">●</span></h1>
+            <p class="header-subtitle">Executive Security Assessment Report</p>
         </div>
         
-
-        
-        <div class="lateral-movement">
-            <h3>🎯 CI/CD & Lateral Movement Targets</h3>
-            {lateral_movement_sections}
-        </div>
-        
-        <div class="discovered-paths">
-            <h3>🔍 Discovered Paths & Files</h3>
-            <div class="paths-collapsible-container">
-                {discovered_paths_sections}
+        <div class="executive-summary">
+            <h2>📊 Executive Summary</h2>
+            <div class="summary-grid">
+                <div class="summary-card {critical_class}">
+                    <div class="summary-number">{vulnerable_count}</div>
+                    <div class="summary-label">Vulnerable Services</div>
+                </div>
+                <div class="summary-card {warning_class}">
+                    <div class="summary-number">{expired_certs_count}</div>
+                    <div class="summary-label">Expired Certificates</div>
+                </div>
+                <div class="summary-card {success_class}">
+                    <div class="summary-number">{total_services}</div>
+                    <div class="summary-label">Total Services Found</div>
+                </div>
+                <div class="summary-card {info_class}">
+                    <div class="summary-number">{lateral_count}</div>
+                    <div class="summary-label">Lateral Movement Targets</div>
+                </div>
+            </div>
+            
+            <div class="vulnerability-analysis">
+                <h3>🔍 Vulnerability Analysis</h3>
+                {vulnerability_explanations}
             </div>
         </div>
         
-        <h3>🔍 Discovered Services</h3>
-        <table id="resultsTable" class="display responsive nowrap" style="width:100%">
-            <thead>
-                <tr>
-                    <th>Service</th>
-                    <th>Type</th>
-                    <th>Target</th>
-                    <th>Title</th>
-                    <th>Status</th>
-                    <th>Screenshot</th>
-                    <th>Headers</th>
-                    <th>Cookies</th>
-                    <th>Subdomains</th>
-                    <th>Certificate</th>
-                </tr>
-            </thead>
-            <tbody>
-                {table_rows}
-            </tbody>
-        </table>
+        <div class="search-controls">
+            <h4>🔍 Search & Filter Controls</h4>
+            <div class="search-row">
+                <div class="search-group">
+                    <label for="globalSearch">Global Search:</label>
+                    <input type="text" id="globalSearch" placeholder="Search across all fields...">
+                </div>
+                <div class="search-group">
+                    <label for="serviceTypeFilter">Service Type:</label>
+                    <select id="serviceTypeFilter">
+                        <option value="">All Types</option>
+                        <option value="web">Web Service</option>
+                        <option value="router">Router</option>
+                        <option value="login">Login</option>
+                        <option value="ci_cd_lateral">CI/CD & Lateral</option>
+                    </select>
+                </div>
+                <div class="search-group">
+                    <label for="protocolFilter">Protocol:</label>
+                    <select id="protocolFilter">
+                        <option value="">All Protocols</option>
+                        <option value="http">HTTP</option>
+                        <option value="https">HTTPS</option>
+                    </select>
+                </div>
+                <div class="search-group">
+                    <label for="vulnerabilityFilter">Vulnerabilities:</label>
+                    <select id="vulnerabilityFilter">
+                        <option value="">All Services</option>
+                        <option value="has_vulns">Has Vulnerabilities</option>
+                        <option value="no_vulns">No Vulnerabilities</option>
+                    </select>
+                </div>
+            </div>
+            <div class="filter-buttons">
+                <button class="filter-btn active" data-filter="all">All Services</button>
+                <button class="filter-btn" data-filter="vulnerable">Vulnerable</button>
+                <button class="filter-btn" data-filter="https">HTTPS Only</button>
+                <button class="filter-btn" data-filter="lateral">Lateral Movement</button>
+                <button class="filter-btn clear-filters">Clear Filters</button>
+            </div>
+        </div>
         
-        {subdomain_table}
-    </div>
-    
-    <!-- Modal for screenshots -->
-    <div id="screenshotModal" class="modal">
-        <span class="close">&times;</span>
-        <img class="modal-content" id="modalImage">
+        <div class="data-table-section">
+            <h3>🌐 Discovered Services</h3>
+            <table id="resultsTable" class="display responsive nowrap" style="width:100%">
+                <thead>
+                    <tr>
+                        <th>Service</th>
+                        <th>Type</th>
+                        <th>Title</th>
+                        <th>Status</th>
+                        <th>Screenshot</th>
+                        <th>Vulnerabilities</th>
+                        <th>Certificate</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {table_rows}
+                </tbody>
+            </table>
+        </div>
+        
+        <div class="data-table-section">
+            <h3>🔍 Discovered Paths & Files</h3>
+            <div id="pathsSection">
+                {discovered_paths_section}
+            </div>
+        </div>
+        
+        <div class="data-table-section">
+            <h3>🎯 CI/CD & Lateral Movement Assets</h3>
+            <div id="cicdSection">
+                {cicd_lateral_section}
+            </div>
+        </div>
+        
+        <div id="screenshotModal" class="modal">
+            <span class="close">&times;</span>
+            <img class="modal-content" id="modalImage">
+        </div>
     </div>
     
     <script src="https://code.jquery.com/jquery-3.6.0.min.js"></script>
@@ -1228,7 +1837,7 @@ class WebDiscoveryScanner:
     <script src="https://cdn.datatables.net/responsive/2.2.9/js/dataTables.responsive.min.js"></script>
     <script>
         $(document).ready(function() {
-            $('#resultsTable').DataTable({
+            var table = $('#resultsTable').DataTable({
                 responsive: true,
                 pageLength: 10,
                 order: [[0, 'asc']],
@@ -1236,35 +1845,79 @@ class WebDiscoveryScanner:
                 autoWidth: false,
                 scrollCollapse: true,
                 columnDefs: [
-                    { targets: [5, 6, 7, 8, 9], orderable: false },
-                    { targets: [6], width: '250px' },  // Headers column - reduced for better fit
-                    { targets: [5], width: '100px' },  // Screenshot column
-                    { targets: [7], width: '120px' },  // Cookies column
-                    { targets: [8], width: '120px' },  // Subdomains column
-                    { targets: [9], width: '180px' }   // Certificate column
+                    { targets: [4, 5, 6], orderable: false },
+                    { targets: [4], width: '100px' },
+                    { targets: [5], width: '150px' },
+                    { targets: [6], width: '200px' }
                 ]
             });
             
-            // Initialize subdomain table if it exists
-            if ($('#subdomainTable').length) {
-                $('#subdomainTable').DataTable({
-                    responsive: true,
-                    pageLength: 10,
-                    order: [[0, 'asc']],
-                    scrollX: true,
-                    autoWidth: false,
-                    columnDefs: [
-                        { targets: [5, 6, 7, 8], orderable: false },
-                        { targets: [6], width: '250px' },  // Headers column - reduced for better fit
-                        { targets: [5], width: '100px' },  // Screenshot column
-                        { targets: [7], width: '120px' },  // Cookies column
-                        { targets: [8], width: '180px' }   // Certificate column
-                    ]
-                });
-            }
-        }});
+            // Global search functionality
+            $('#globalSearch').on('keyup', function() {
+                table.search(this.value).draw();
+            });
+            
+            // Service type filter
+            $('#serviceTypeFilter').on('change', function() {
+                var filterValue = $(this).val();
+                if (filterValue) {
+                    table.column(1).search(filterValue).draw();
+                } else {
+                    table.column(1).search('').draw();
+                }
+            });
+            
+            // Protocol filter
+            $('#protocolFilter').on('change', function() {
+                var filterValue = $(this).val();
+                if (filterValue) {
+                    table.column(0).search(filterValue).draw();
+                } else {
+                    table.column(0).search('').draw();
+                }
+            });
+            
+            // Vulnerability filter
+            $('#vulnerabilityFilter').on('change', function() {
+                var filterValue = $(this).val();
+                if (filterValue === 'has_vulns') {
+                    table.column(5).search('found').draw();
+                } else if (filterValue === 'no_vulns') {
+                    table.column(5).search('None').draw();
+                } else {
+                    table.column(5).search('').draw();
+                }
+            });
+            
+            // Filter buttons
+            $('.filter-btn').on('click', function() {
+                $('.filter-btn').removeClass('active');
+                $(this).addClass('active');
+                
+                var filter = $(this).data('filter');
+                if (filter === 'vulnerable') {
+                    table.column(5).search('found').draw();
+                } else if (filter === 'https') {
+                    table.column(0).search('https').draw();
+                } else if (filter === 'lateral') {
+                    table.column(1).search('ci_cd_lateral').draw();
+                } else {
+                    table.search('').columns().search('').draw();
+                }
+            });
+            
+            // Clear filters
+            $('.clear-filters').on('click', function() {
+                $('#globalSearch').val('');
+                $('#serviceTypeFilter').val('');
+                $('#protocolFilter').val('');
+                $('#vulnerabilityFilter').val('');
+                $('.filter-btn').removeClass('active');
+                $('.filter-btn[data-filter="all"]').addClass('active');
+                table.search('').columns().search('').draw();
+            });
+        });
         
-        // Modal functionality
         var modal = document.getElementById("screenshotModal");
         var modalImg = document.getElementById("modalImage");
         var span = document.getElementsByClassName("close")[0];
@@ -1284,7 +1937,6 @@ class WebDiscoveryScanner:
             }
         }
         
-        // Auto-refresh every 30 seconds
         setTimeout(function() {
             location.reload();
         }, 30000);
@@ -1292,141 +1944,116 @@ class WebDiscoveryScanner:
 </body>
 </html>
         """
+    
+    def _generate_vulnerability_explanations(self) -> str:
+        """Generate detailed vulnerability explanations for the executive summary"""
+        explanations = ""
         
-
+        # Collect all unique vulnerabilities
+        all_vulns = set()
+        for service in self.results:
+            if service.vulnerabilities:
+                for vuln in service.vulnerabilities:
+                    all_vulns.add(vuln)
         
-        # Generate discovered paths sections
-        discovered_paths_sections = ""
-        services_with_paths = {}
+        if not all_vulns:
+            explanations = """
+            <div class="vuln-category success">
+                <div class="vuln-title">✅ No Critical Vulnerabilities Detected</div>
+                <div class="vuln-description">The scan did not identify any critical security vulnerabilities in the discovered services.</div>
+                <div class="vuln-impact info">This is a positive security indicator, but regular monitoring is still recommended.</div>
+            </div>
+            """
+            return explanations
         
-        for i, service in enumerate(self.results):
-            if service.discovered_paths:
-                service_url = f"{service.protocol}://{service.ip}:{service.port}"
-                services_with_paths[service_url] = {
-                    'index': i,
-                    'ip': service.ip,
-                    'port': service.port,
-                    'protocol': service.protocol,
-                    'paths': service.discovered_paths
-                }
+        # Categorize vulnerabilities
+        vuln_categories = {
+            'server_info': [],
+            'default_creds': [],
+            'expired_certs': [],
+            'missing_headers': [],
+            'other': []
+        }
         
-        if services_with_paths:
-            for service_url, service_info in services_with_paths.items():
-                paths_html = ""
-                status_counts = {'200': 0, '301': 0, '302': 0, '401': 0, '403': 0, 'other': 0}
-                
-                for path in service_info['paths']:
-                    # Extract status code from path string (format: "/path (status)")
-                    status_match = re.search(r'\((\d+)\)$', path)
-                    status_code = status_match.group(1) if status_match else "200"
-                    
-                    # Count status codes
-                    if status_code == "200":
-                        status_counts['200'] += 1
-                    elif status_code == "301":
-                        status_counts['301'] += 1
-                    elif status_code == "302":
-                        status_counts['302'] += 1
-                    elif status_code == "401":
-                        status_counts['401'] += 1
-                    elif status_code == "403":
-                        status_counts['403'] += 1
-                    else:
-                        status_counts['other'] += 1
-                    
-                    # Clean path name (remove status code)
-                    clean_path = re.sub(r'\s*\(\d+\)$', '', path)
-                    full_url = f"{service_url}{clean_path}"
-                    
-                    # Color coding based on status
-                    if status_code == "200":
-                        badge_class = "path-badge-success"
-                    elif status_code in ["301", "302"]:
-                        badge_class = "path-badge-redirect"
-                    elif status_code == "401":
-                        badge_class = "path-badge-auth"
-                    elif status_code == "403":
-                        badge_class = "path-badge-forbidden"
-                    else:
-                        badge_class = "path-badge-other"
-                    
-                    paths_html += f'<a href="{full_url}" target="_blank" class="{badge_class}">{clean_path} ({status_code})</a> '
-                
-                # Create status summary
-                status_summary = []
-                if status_counts['200'] > 0:
-                    status_summary.append(f"✅ {status_counts['200']} OK")
-                if status_counts['301'] + status_counts['302'] > 0:
-                    status_summary.append(f"🔄 {status_counts['301'] + status_counts['302']} Redirect")
-                if status_counts['401'] > 0:
-                    status_summary.append(f"🔐 {status_counts['401']} Auth")
-                if status_counts['403'] > 0:
-                    status_summary.append(f"🚫 {status_counts['403']} Forbidden")
-                if status_counts['other'] > 0:
-                    status_summary.append(f"❓ {status_counts['other']} Other")
-                
-                status_summary_text = " | ".join(status_summary)
-                
-                discovered_paths_sections += f"""
-                <div class="service-paths-group">
-                    <button type="button" class="paths-collapsible" style="background:#f0f8ff; color:#333; border:none; padding:8px 12px; border-radius:4px; font-weight:bold; cursor:pointer; width:100%; text-align:left;">
-                        🌐 {service_info['ip']}:{service_info['port']} ({service_info['protocol'].upper()}) - {len(service_info['paths'])} paths found | {status_summary_text}
-                    </button>
-                    <div class="paths-content" style="display:none; padding:10px 15px 10px 15px; background:#f9f9f9; border-radius:0 0 4px 4px; border:1px solid #e0e0e0; border-top:none;">
-                        {paths_html}
-                    </div>
-                </div>
-                """
-        else:
-            discovered_paths_sections = "<p>No additional paths discovered yet.</p>"
-        
-        # Generate lateral movement target sections
-        lateral_movement_sections = ""
-        lateral_targets = {}
-        
-        for i, service in enumerate(self.results):
-            if service.specific_target:
-                if service.specific_target not in lateral_targets:
-                    lateral_targets[service.specific_target] = []
-                lateral_targets[service.specific_target].append({
-                    'index': i,
-                    'ip': service.ip,
-                    'port': service.port,
-                    'title': service.title,
-                    'service_type': service.service_type
-                })
-        
-        for target_name, items in lateral_targets.items():
-            if items:
-                target_links = ""
-                for item in items:
-                    target_links += f'<a href="#row-{item["index"]}" class="target-link">{item["ip"]}:{item["port"]} - {item["title"][:30]}... [{item["service_type"]}]</a>'
-                
-                target_display_name = target_name.replace('_', ' ').title()
-                lateral_movement_sections += f"""
-                <div class="target-group">
-                    <strong>🎯 {target_display_name} ({len(items)} found):</strong><br>
-                    {target_links}
-                </div>
-                """
-        
-        if not lateral_movement_sections:
-            lateral_movement_sections = "<p>No CI/CD or lateral movement targets detected yet.</p>"
-        
-        # Generate table rows (main services only)
-        table_rows = ""
-        subdomain_rows = ""
-        main_services = []
-        subdomain_services = []
-        
-        for i, service in enumerate(self.results):
-            if service.is_subdomain:
-                subdomain_services.append((i, service))
+        for vuln in all_vulns:
+            if 'server info disclosure' in vuln.lower():
+                vuln_categories['server_info'].append(vuln)
+            elif 'default_creds' in vuln.lower():
+                vuln_categories['default_creds'].append(vuln)
+            elif 'expired' in vuln.lower() or 'certificate' in vuln.lower():
+                vuln_categories['expired_certs'].append(vuln)
+            elif 'missing' in vuln.lower() and 'header' in vuln.lower():
+                vuln_categories['missing_headers'].append(vuln)
             else:
-                main_services.append((i, service))
+                vuln_categories['other'].append(vuln)
         
-        # Generate main services table
-        for i, service in main_services:
+        # Generate explanations for each category
+        if vuln_categories['server_info']:
+            explanations += """
+            <div class="vuln-category warning">
+                <div class="vuln-title">⚠️ Server Information Disclosure</div>
+                <div class="vuln-description">Web servers are revealing detailed version information that could aid attackers in identifying potential exploits.</div>
+                <div class="vuln-impact warning">
+                    <strong>Impact:</strong> Attackers can use this information to target specific vulnerabilities for the disclosed server versions.
+                    <br><strong>Recommendation:</strong> Configure servers to hide version information and use generic server banners.
+                </div>
+            </div>
+            """
+        
+        if vuln_categories['default_creds']:
+            explanations += """
+            <div class="vuln-category critical">
+                <div class="vuln-title">🚨 Default Credentials Active</div>
+                <div class="vuln-description">Services are accessible using default or weak credentials, providing unauthorized access to sensitive systems.</div>
+                <div class="vuln-impact">
+                    <strong>Impact:</strong> Immediate unauthorized access to systems, potential data breach, and lateral movement capabilities.
+                    <br><strong>Recommendation:</strong> Immediately change all default passwords and implement strong authentication policies.
+                </div>
+            </div>
+            """
+        
+        if vuln_categories['expired_certs']:
+            explanations += """
+            <div class="vuln-category warning">
+                <div class="vuln-title">⚠️ Expired SSL Certificates</div>
+                <div class="vuln-description">SSL/TLS certificates have expired, potentially causing browser warnings and reducing user trust.</div>
+                <div class="vuln-impact warning">
+                    <strong>Impact:</strong> Browser security warnings, potential man-in-the-middle attacks, reduced user confidence.
+                    <br><strong>Recommendation:</strong> Renew certificates immediately and implement automated certificate monitoring.
+                </div>
+            </div>
+            """
+        
+        if vuln_categories['missing_headers']:
+            explanations += """
+            <div class="vuln-category info">
+                <div class="vuln-title">ℹ️ Missing Security Headers</div>
+                <div class="vuln-description">Web applications are missing recommended security headers that help protect against common attacks.</div>
+                <div class="vuln-impact info">
+                    <strong>Impact:</strong> Increased risk of XSS, clickjacking, and other client-side attacks.
+                    <br><strong>Recommendation:</strong> Implement security headers like X-Frame-Options, X-Content-Type-Options, and Content-Security-Policy.
+                </div>
+            </div>
+            """
+        
+        if vuln_categories['other']:
+            explanations += """
+            <div class="vuln-category info">
+                <div class="vuln-title">ℹ️ Other Security Findings</div>
+                <div class="vuln-description">Additional security observations that should be reviewed and addressed.</div>
+                <div class="vuln-impact info">
+                    <strong>Findings:</strong> Review each finding individually and implement appropriate security measures.
+                </div>
+            </div>
+            """
+        
+        return explanations
+    
+    def _generate_table_rows(self) -> str:
+        """Generate table rows for the services data table"""
+        table_rows = ""
+        
+        for i, service in enumerate(self.results):
             service_url = f"{service.protocol}://{service.ip}:{service.port}"
             
             # Service type badge
@@ -1436,372 +2063,269 @@ class WebDiscoveryScanner:
             # Screenshot cell
             screenshot_cell = ""
             if service.screenshot_file:
-                # Fix path for HTML display - use screenshots subdirectory
                 screenshot_filename = Path(service.screenshot_file).name
                 relative_path = f"screenshots/{screenshot_filename}"
                 if Path(service.screenshot_file).exists():
                     screenshot_cell = f'<img src="{relative_path}" class="screenshot" onclick="openModal(\'{relative_path}\')" alt="Screenshot">'
                 else:
-                    screenshot_cell = f'<em>Screenshot not found: {screenshot_filename}</em>'
+                    screenshot_cell = f'<em>Not found</em>'
             else:
                 screenshot_cell = '<em>No screenshot</em>'
             
-            # Headers cell - show ALL headers
-            headers_html = ""
-            if service.headers:
-                headers_html = '<div class="headers-section">'
-                # Show ALL headers with expandable view
-                for key, value in service.headers.items():
-                    # Truncate very long values for display
-                    display_value = value
-                    if len(value) > 100:
-                        display_value = value[:97] + "..."
-                    headers_html += f'<strong>{key}:</strong> {display_value}<br>'
-                headers_html += '</div>'
-            
-            # Cookies cell
-            cookies_html = ""
-            if service.cookies:
-                cookies_html = '<div class="cookies-section">'
-                for cookie in service.cookies:
-                    cookies_html += f'<span class="cookie-badge">{cookie}</span> '
-                cookies_html += '</div>'
+            # Vulnerabilities cell
+            vuln_cell = ""
+            if service.vulnerabilities:
+                vuln_count = len(service.vulnerabilities)
+                vuln_cell = f'<span style="color: #e53e3e; font-weight: bold;">{vuln_count} found</span>'
+                for vuln in service.vulnerabilities[:2]:  # Show first 2
+                    vuln_cell += f'<br><small style="color: #666;">• {vuln[:50]}...</small>'
+                if len(service.vulnerabilities) > 2:
+                    vuln_cell += f'<br><small style="color: #666;">... and {len(service.vulnerabilities) - 2} more</small>'
             else:
-                cookies_html = '<em>No cookies</em>'
+                vuln_cell = '<span style="color: #38a169;">None</span>'
             
-            # Subdomains cell
-            subdomains_html = ""
-            if service.subdomains:
-                subdomains_html = '<div class="subdomains-section">'
-                for subdomain in service.subdomains:
-                    subdomains_html += f'<span class="subdomain-badge">{subdomain}</span> '
-                subdomains_html += '</div>'
-            else:
-                subdomains_html = '<em>No subdomains found</em>'
-            
-            # Certificate cell with detailed information
+            # Certificate cell with colored badges
             cert_cell = ""
             if service.cert_expiry:
-                status_class = f"status-{service.cert_status.lower().replace(' ', '-')}"
-                cert_cell = f'<div class="cert-info">'
-                cert_cell += f'<strong>Subject:</strong> {service.cert_subject}<br>'
-                cert_cell += f'<strong>Issuer:</strong> {service.cert_issuer}<br>'
+                if service.cert_status == "Expired":
+                    status_badge = '<span style="background: #fc8181; color: white; padding: 4px 8px; border-radius: 12px; font-size: 10px; font-weight: bold;">EXPIRED</span>'
+                elif service.cert_status == "Expiring Soon":
+                    status_badge = '<span style="background: #f6ad55; color: white; padding: 4px 8px; border-radius: 12px; font-size: 10px; font-weight: bold;">EXPIRING</span>'
+                else:
+                    status_badge = '<span style="background: #68d391; color: white; padding: 4px 8px; border-radius: 12px; font-size: 10px; font-weight: bold;">VALID</span>'
+                
+                cert_cell = f'<div style="font-size: 12px;">'
                 cert_cell += f'<strong>Expires:</strong> {service.cert_expiry}<br>'
-                cert_cell += f'<span class="{status_class}">{service.cert_status}</span>'
+                cert_cell += status_badge
                 if service.cert_sans:
-                    cert_cell += f'<br><strong>SANs:</strong> {", ".join(service.cert_sans[:3])}'
-                    if len(service.cert_sans) > 3:
-                        cert_cell += f' (+{len(service.cert_sans) - 3} more)'
+                    cert_cell += f'<br><small>SANs: {len(service.cert_sans)} domains</small>'
                 cert_cell += '</div>'
-            
-
-            
-            # Target badge
-            target_cell = ""
-            if service.specific_target:
-                target_cell = f'<span class="service-type type-ci_cd_lateral">{service.specific_target.upper()}</span>'
-            
-
+            else:
+                cert_cell = '<em>No certificate</em>'
             
             # Service cell with domain name if available
-            service_cell = f'<a href="{service_url}" target="_blank">{service.ip}:{service.port}</a>'
+            service_cell = f'<a href="{service_url}" target="_blank" style="font-weight: 600;">{service.ip}:{service.port}</a>'
             if service.domain_name:
                 service_cell += f'<br><small style="color: #666;">🌐 {service.domain_name}</small>'
             
+            # Status cell with color coding
+            status_color = "#38a169" if service.status_code == 200 else "#e53e3e" if service.status_code >= 400 else "#d69e2e"
+            status_cell = f'<span style="color: {status_color}; font-weight: bold;">{service.status_code}</span>'
+            
             table_rows += f"""
-                <tr id="row-{i}">
+                <tr>
                     <td>{service_cell}</td>
                     <td>{type_badge}</td>
-                    <td>{target_cell}</td>
-                    <td>{service.title}</td>
-                    <td>{service.status_code}</td>
+                    <td>{service.title or 'No title'}</td>
+                    <td>{status_cell}</td>
                     <td>{screenshot_cell}</td>
-                    <td>{headers_html}</td>
-                    <td>{cookies_html}</td>
-                    <td>{subdomains_html}</td>
+                    <td>{vuln_cell}</td>
                     <td>{cert_cell}</td>
                 </tr>
             """
         
-        # Generate subdomain services table
-        if subdomain_services:
-            subdomain_table = f"""
-            <div style="margin-top: 40px; padding-top: 20px; border-top: 3px solid #007bff; background: #f8f9fa; padding: 20px; border-radius: 8px;">
-            <h3 style="color: #007bff; margin-bottom: 20px;">🔍 Discovered Subdomain Services (Not in Original Scope)</h3>
-            <table id="subdomainTable" class="display responsive nowrap" style="width:100%">
-                <thead>
-                    <tr>
-                        <th>Subdomain</th>
-                        <th>Type</th>
-                        <th>Title</th>
-                        <th>Status</th>
-                        <th>Screenshot</th>
-                        <th>Headers</th>
-                        <th>Cookies</th>
-                        <th>Certificate</th>
-                    </tr>
-                </thead>
-                <tbody>
-            """
-            
-            for i, service in subdomain_services:
-                service_url = f"{service.protocol}://{service.ip}:{service.port}"
-                
-                # Service cell with domain name if available
-                service_cell = f'<a href="{service_url}" target="_blank">{service.ip}:{service.port}</a>'
-                if service.domain_name:
-                    service_cell += f'<br><small style="color: #666;">🌐 {service.domain_name}</small>'
-                
-                # Service type badge
-                type_class = f"type-{service.service_type}"
-                type_badge = f'<span class="service-type {type_class}">{service.service_type.upper()}</span>'
-                
-                # Screenshot cell
-                screenshot_cell = ""
-                if service.screenshot_file:
-                    # Fix path for HTML display - use screenshots subdirectory
-                    screenshot_filename = Path(service.screenshot_file).name
-                    relative_path = f"screenshots/{screenshot_filename}"
-                    if Path(service.screenshot_file).exists():
-                        screenshot_cell = f'<img src="{relative_path}" class="screenshot" onclick="openModal(\'{relative_path}\')" alt="Screenshot">'
-                    else:
-                        screenshot_cell = f'<em>Screenshot not found: {screenshot_filename}</em>'
-                else:
-                    screenshot_cell = '<em>No screenshot</em>'
-                
-                # Headers cell - compact version
-                headers_html = ""
-                if service.headers:
-                                    headers_html = '<div class="headers-section">'
-                # Show ALL headers for subdomains too
-                for key, value in service.headers.items():
-                    # Truncate very long values for display
-                    display_value = value
-                    if len(value) > 100:
-                        display_value = value[:97] + "..."
-                    headers_html += f'<strong>{key}:</strong> {display_value}<br>'
-                headers_html += '</div>'
-                
-                # Cookies cell
-                cookies_html = ""
-                if service.cookies:
-                    cookies_html = '<div class="cookies-section">'
-                    for cookie in service.cookies:
-                        cookies_html += f'<span class="cookie-badge">{cookie}</span> '
-                    cookies_html += '</div>'
-                else:
-                    cookies_html = '<em>No cookies</em>'
-                
-                # Certificate cell
-                cert_cell = ""
-                if service.cert_expiry:
-                    status_class = f"status-{service.cert_status.lower().replace(' ', '-')}"
-                    cert_cell = f'<div class="cert-info">'
-                    cert_cell += f'<strong>Subject:</strong> {service.cert_subject}<br>'
-                    cert_cell += f'<strong>Issuer:</strong> {service.cert_issuer}<br>'
-                    cert_cell += f'<strong>Expires:</strong> {service.cert_expiry}<br>'
-                    cert_cell += f'<span class="{status_class}">{service.cert_status}</span>'
-                    if service.cert_sans:
-                        cert_cell += f'<br><strong>SANs:</strong> {", ".join(service.cert_sans[:3])}'
-                        if len(service.cert_sans) > 3:
-                            cert_cell += f' (+{len(service.cert_sans) - 3} more)'
-                    cert_cell += '</div>'
-                
-
-                
-                # Target badge
-                target_cell = ""
-                if service.specific_target:
-                    target_cell = f'<span class="service-type type-ci_cd_lateral">{service.specific_target.upper()}</span>'
-                
-                subdomain_rows += f"""
-                    <tr id="subdomain-row-{i}">
-                        <td>{service_cell}</td>
-                        <td>{type_badge}</td>
-                        <td>{target_cell}</td>
-                        <td>{service.title}</td>
-                        <td>{service.status_code}</td>
-                        <td>{screenshot_cell}</td>
-                        <td>{headers_html}</td>
-                        <td>{cookies_html}</td>
-                        <td>{cert_cell}</td>
-                    </tr>
-                """
-            
-            subdomain_table += subdomain_rows + """
-                </tbody>
-            </table>
-            </div>
-            """
-        else:
-            subdomain_table = ""
+        return table_rows
+    
+    def _generate_discovered_paths_section(self) -> str:
+        """Generate discovered paths section with status badges"""
+        paths_html = ""
         
-        # Calculate summary statistics
-        scan_date = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        total_services = len(self.results)
-        service_types = ", ".join(set(s.service_type for s in self.results))
-        https_count = len([s for s in self.results if s.protocol == 'https'])
-        
-        # Format targets for display
-        if len(self.original_targets) == 1 and '/' in self.original_targets[0]:
-            # Single subnet
-            targets_display = f"Subnet: {self.original_targets[0]}"
-        elif len(self.original_targets) <= 5:
-            # Show all targets if 5 or fewer
-            targets_display = ", ".join(self.original_targets)
-        else:
-            # Show first 3 and count
-            targets_display = f"{', '.join(self.original_targets[:3])}... (+{len(self.original_targets) - 3} more)"
-        
-        # Collect default credentials found
-        default_creds_found = []
+        # Collect all services with discovered paths
+        services_with_paths = []
         for service in self.results:
-            if service.vulnerabilities:
-                for vuln in service.vulnerabilities:
-                    if 'default_creds_working' in vuln:
-                        cred_info = vuln.split('default_creds_working:')[1]
-                        default_creds_found.append(f"{service.ip}:{service.port} - {cred_info}")
+            if service.discovered_paths:
+                services_with_paths.append(service)
         
-        creds_display = ""
-        if default_creds_found:
-            creds_display = f'<p><strong>🔑 Default Credentials Found:</strong> {len(default_creds_found)}</p>'
-            creds_display += '<div style="background:#fff3cd; padding:10px; border-radius:4px; margin:5px 0;">'
-            for cred in default_creds_found:
-                creds_display += f'<div style="margin:2px 0;">• {cred}</div>'
-            creds_display += '</div>'
+        if not services_with_paths:
+            return '<p style="text-align: center; color: #718096; font-style: italic;">No additional paths discovered during this scan.</p>'
         
-        # Generate summary details for all main services (not subdomains)
-        summary_details_html = '<div style="margin-top:15px;">'
-        summary_details_html += '<h4>Service Details Preview</h4>'
-        if main_services:
-            for i, service in main_services:
-                service_id = f"summary-details-{i}"
-                summary_details_html += f'''
-                <div style="margin-bottom:10px;">
-                  <button type="button" class="collapsible" style="background:#e8f4fd; color:#333; border:none; padding:8px 12px; border-radius:4px; font-weight:bold; cursor:pointer; width:100%; text-align:left;">{service.ip}:{service.port} ({service.protocol.upper()}) - {service.title if service.title else ''}</button>
-                  <div class="content" style="display:none; padding:10px 15px 10px 15px; background:#f9f9f9; border-radius:0 0 4px 4px; border:1px solid #e0e0e0; border-top:none;">
-                    <div><strong>Headers:</strong><br>
-                '''
-                if service.headers:
-                    summary_details_html += '<div class="headers-section">'
-                    for key, value in service.headers.items():
-                        summary_details_html += f'<strong>{key}:</strong> {value}<br>'
-                    summary_details_html += '</div>'
+        for service in services_with_paths:
+            service_url = f"{service.protocol}://{service.ip}:{service.port}"
+            paths_html += f'<div style="margin-bottom: 30px; background: #f7fafc; border-radius: 12px; padding: 20px;">'
+            paths_html += f'<h4 style="margin-bottom: 15px; color: #2d3748;">🌐 {service.ip}:{service.port} ({service.protocol.upper()})</h4>'
+            
+            # Count status codes
+            status_counts = {'200': 0, '301': 0, '302': 0, '401': 0, '403': 0, 'other': 0}
+            paths_list = ""
+            
+            for path in service.discovered_paths:
+                # Extract status code from path string (format: "/path (status)")
+                import re
+                status_match = re.search(r'\((\d+)\)$', path)
+                status_code = status_match.group(1) if status_match else "200"
+                
+                # Count status codes
+                if status_code == "200":
+                    status_counts['200'] += 1
+                    badge_class = "path-badge-success"
+                elif status_code == "301":
+                    status_counts['301'] += 1
+                    badge_class = "path-badge-redirect"
+                elif status_code == "302":
+                    status_counts['302'] += 1
+                    badge_class = "path-badge-redirect"
+                elif status_code == "401":
+                    status_counts['401'] += 1
+                    badge_class = "path-badge-auth"
+                elif status_code == "403":
+                    status_counts['403'] += 1
+                    badge_class = "path-badge-forbidden"
                 else:
-                    summary_details_html += '<em>No headers</em>'
-                summary_details_html += '</div>'
-                summary_details_html += '<div><strong>Cookies:</strong><br>'
-                if service.cookies:
-                    summary_details_html += '<div class="cookies-section">'
-                    for cookie in service.cookies:
-                        summary_details_html += f'<span class="cookie-badge">{cookie}</span> '
-                    summary_details_html += '</div>'
-                else:
-                    summary_details_html += '<em>No cookies</em>'
-                summary_details_html += '</div>'
-                summary_details_html += '<div><strong>Subdomains:</strong><br>'
-                if service.subdomains:
-                    summary_details_html += '<div class="subdomains-section">'
-                    for subdomain in service.subdomains:
-                        summary_details_html += f'<span class="subdomain-badge">{subdomain}</span> '
-                    summary_details_html += '</div>'
-                else:
-                    summary_details_html += '<em>No subdomains found</em>'
-                summary_details_html += '</div>'
-                summary_details_html += '<div><strong>Certificate:</strong><br>'
-                if service.cert_expiry:
-                    status_class = f"status-{service.cert_status.lower().replace(' ', '-')}"
-                    summary_details_html += f'<div class="cert-info">'
-                    summary_details_html += f'<strong>Subject:</strong> {service.cert_subject}<br>'
-                    summary_details_html += f'<strong>Issuer:</strong> {service.cert_issuer}<br>'
-                    summary_details_html += f'<strong>Expires:</strong> {service.cert_expiry}<br>'
-                    summary_details_html += f'<span class="{status_class}">{service.cert_status}</span>'
-                    if service.cert_sans:
-                        summary_details_html += f'<br><strong>SANs:</strong> {', '.join(service.cert_sans[:3])}'
-                        if len(service.cert_sans) > 3:
-                            summary_details_html += f' (+{len(service.cert_sans) - 3} more)'
-                    summary_details_html += '</div>'
-                else:
-                    summary_details_html += '<em>No certificate info</em>'
-                summary_details_html += '</div>'
-                summary_details_html += '</div></div>'
-        else:
-            summary_details_html += '<em>No services found yet.</em>'
-        summary_details_html += '</div>'
+                    status_counts['other'] += 1
+                    badge_class = "path-badge-other"
+                
+                # Clean path name (remove status code)
+                clean_path = re.sub(r'\s*\(\d+\)$', '', path)
+                full_url = f"{service_url}{clean_path}"
+                
+                paths_list += f'<a href="{full_url}" target="_blank" class="{badge_class}">{clean_path} ({status_code})</a> '
+            
+            # Create status summary
+            status_summary = []
+            if status_counts['200'] > 0:
+                status_summary.append(f'<span style="background: #68d391; color: white; padding: 4px 8px; border-radius: 12px; font-size: 12px; margin-right: 8px;">✅ {status_counts["200"]} OK</span>')
+            if status_counts['301'] + status_counts['302'] > 0:
+                status_summary.append(f'<span style="background: #f6ad55; color: white; padding: 4px 8px; border-radius: 12px; font-size: 12px; margin-right: 8px;">🔄 {status_counts["301"] + status_counts["302"]} Redirect</span>')
+            if status_counts['401'] > 0:
+                status_summary.append(f'<span style="background: #63b3ed; color: white; padding: 4px 8px; border-radius: 12px; font-size: 12px; margin-right: 8px;">🔐 {status_counts["401"]} Auth</span>')
+            if status_counts['403'] > 0:
+                status_summary.append(f'<span style="background: #fc8181; color: white; padding: 4px 8px; border-radius: 12px; font-size: 12px; margin-right: 8px;">🚫 {status_counts["403"]} Forbidden</span>')
+            if status_counts['other'] > 0:
+                status_summary.append(f'<span style="background: #a0aec0; color: white; padding: 4px 8px; border-radius: 12px; font-size: 12px; margin-right: 8px;">❓ {status_counts["other"]} Other</span>')
+            
+            paths_html += f'<div style="margin-bottom: 15px;">{" ".join(status_summary)}</div>'
+            paths_html += f'<div style="background: white; border-radius: 8px; padding: 15px; border: 1px solid #e2e8f0;">{paths_list}</div>'
+            paths_html += '</div>'
         
-        # Add targets and credentials to summary BEFORE replacing placeholders
-        html_template = html_template.replace(
-            '<p><strong>Scan Date:</strong> {scan_date}</p>',
-            f'<p><strong>Scan Date:</strong> {scan_date}</p>\n            <p><strong>🎯 Targets:</strong> {targets_display}</p>'
-        )
+        return paths_html
+    
+    def _generate_cicd_lateral_section(self) -> str:
+        """Generate CI/CD and lateral movement assets section"""
+        cicd_html = ""
         
-        # Add credentials section after HTTPS services
-        if creds_display:
-            html_template = html_template.replace(
-                '<p><strong>HTTPS Services:</strong> {https_count}</p>',
-                f'<p><strong>HTTPS Services:</strong> {https_count}</p>\n            {creds_display}'
-            )
+        # Collect all CI/CD and lateral movement targets
+        cicd_targets = {}
+        lateral_targets = {}
         
-        # Insert summary_details_html after the summary stats in the summary section
-        html_template = html_template.replace(
-            '<p><strong>HTTPS Services:</strong> {https_count}</p>\n        </div>',
-            '<p><strong>HTTPS Services:</strong> {https_count}</p>\n        ' + summary_details_html + '\n        </div>'
-        )
+        for service in self.results:
+            if service.specific_target:
+                if service.specific_target not in cicd_targets:
+                    cicd_targets[service.specific_target] = []
+                cicd_targets[service.specific_target].append(service)
+            
+            # Check for lateral movement indicators
+            if any(keyword in service.title.lower() for keyword in ['jenkins', 'gitlab', 'github', 'bitbucket', 'teamcity', 'bamboo', 'azure devops', 'jira', 'confluence', 'sonarqube', 'nexus', 'artifactory']):
+                if 'lateral_movement' not in lateral_targets:
+                    lateral_targets['lateral_movement'] = []
+                lateral_targets['lateral_movement'].append(service)
+            
+            # Check for database services
+            if any(keyword in service.title.lower() for keyword in ['mysql', 'postgresql', 'mongodb', 'redis', 'elasticsearch', 'kibana', 'grafana', 'prometheus']):
+                if 'databases' not in lateral_targets:
+                    lateral_targets['databases'] = []
+                lateral_targets['databases'].append(service)
+            
+            # Check for monitoring services
+            if any(keyword in service.title.lower() for keyword in ['zabbix', 'nagios', 'prtg', 'solarwinds', 'datadog', 'newrelic', 'splunk']):
+                if 'monitoring' not in lateral_targets:
+                    lateral_targets['monitoring'] = []
+                lateral_targets['monitoring'].append(service)
         
-        # Replace placeholders in the summary section
-        html_template = html_template.replace('{scan_date}', scan_date)
-        html_template = html_template.replace('{total_services}', str(total_services))
-        html_template = html_template.replace('{service_types}', service_types)
-        html_template = html_template.replace('{https_count}', str(https_count))
+        # Generate CI/CD section
+        if cicd_targets:
+            cicd_html += '<div style="margin-bottom: 30px; background: #fff5f5; border-radius: 12px; padding: 20px; border-left: 4px solid #fc8181;">'
+            cicd_html += '<h3 style="margin-bottom: 20px; color: #c53030;">🚨 CI/CD & Development Assets</h3>'
+            
+            for target_type, services in cicd_targets.items():
+                cicd_html += f'<div style="margin-bottom: 20px;">'
+                cicd_html += f'<h4 style="margin-bottom: 10px; color: #2d3748;">🎯 {target_type.replace("_", " ").title()} ({len(services)} found)</h4>'
+                
+                for service in services:
+                    service_url = f"{service.protocol}://{service.ip}:{service.port}"
+                    cicd_html += f'<div style="background: white; border-radius: 8px; padding: 15px; margin-bottom: 10px; border: 1px solid #fed7d7;">'
+                    cicd_html += f'<div style="display: flex; justify-content: space-between; align-items: center;">'
+                    cicd_html += f'<div>'
+                    cicd_html += f'<a href="{service_url}" target="_blank" style="font-weight: 600; color: #c53030;">{service.ip}:{service.port}</a>'
+                    if service.domain_name:
+                        cicd_html += f'<br><small style="color: #666;">🌐 {service.domain_name}</small>'
+                    cicd_html += f'<br><span style="color: #4a5568;">{service.title}</span>'
+                    cicd_html += f'</div>'
+                    
+                    # Add screenshot if available
+                    if service.screenshot_file:
+                        screenshot_filename = Path(service.screenshot_file).name
+                        relative_path = f"screenshots/{screenshot_filename}"
+                        cicd_html += f'<img src="{relative_path}" class="screenshot" onclick="openModal(\'{relative_path}\')" alt="Screenshot" style="max-width: 80px; max-height: 60px;">'
+                    
+                    cicd_html += f'</div>'
+                    
+                    # Add vulnerabilities if any
+                    if service.vulnerabilities:
+                        cicd_html += f'<div style="margin-top: 10px;">'
+                        cicd_html += f'<span style="color: #e53e3e; font-weight: bold;">⚠️ Vulnerabilities:</span>'
+                        for vuln in service.vulnerabilities:
+                            cicd_html += f'<br><small style="color: #666;">• {vuln}</small>'
+                        cicd_html += f'</div>'
+                    
+                    cicd_html += f'</div>'
+                
+                cicd_html += f'</div>'
+            
+            cicd_html += '</div>'
         
-        # Add collapsible JS and CSS
-        collapsible_js = r"""
-<script>
-var coll = document.getElementsByClassName("collapsible");
-for (var i = 0; i < coll.length; i++) {
-  coll[i].addEventListener("click", function() {
-    this.classList.toggle("active");
-    var content = this.nextElementSibling;
-    if (content.style.display === "block") {
-      content.style.display = "none";
-    } else {
-      content.style.display = "block";
-    }
-  });
-}
-
-var pathsColl = document.getElementsByClassName("paths-collapsible");
-for (var i = 0; i < pathsColl.length; i++) {
-  pathsColl[i].addEventListener("click", function() {
-    this.classList.toggle("active");
-    var content = this.nextElementSibling;
-    if (content.style.display === "block") {
-      content.style.display = "none";
-    } else {
-      content.style.display = "block";
-    }
-  });
-}
-</script>
-"""
-        html_template = html_template.replace('</body>', collapsible_js + '\n</body>')
+        # Generate lateral movement section
+        if lateral_targets:
+            cicd_html += '<div style="margin-bottom: 30px; background: #f0fff4; border-radius: 12px; padding: 20px; border-left: 4px solid #68d391;">'
+            cicd_html += '<h3 style="margin-bottom: 20px; color: #2f855a;">🎯 Lateral Movement Targets</h3>'
+            
+            for target_type, services in lateral_targets.items():
+                cicd_html += f'<div style="margin-bottom: 20px;">'
+                cicd_html += f'<h4 style="margin-bottom: 10px; color: #2d3748;">🔗 {target_type.replace("_", " ").title()} ({len(services)} found)</h4>'
+                
+                for service in services:
+                    service_url = f"{service.protocol}://{service.ip}:{service.port}"
+                    cicd_html += f'<div style="background: white; border-radius: 8px; padding: 15px; margin-bottom: 10px; border: 1px solid #c6f6d5;">'
+                    cicd_html += f'<div style="display: flex; justify-content: space-between; align-items: center;">'
+                    cicd_html += f'<div>'
+                    cicd_html += f'<a href="{service_url}" target="_blank" style="font-weight: 600; color: #2f855a;">{service.ip}:{service.port}</a>'
+                    if service.domain_name:
+                        cicd_html += f'<br><small style="color: #666;">🌐 {service.domain_name}</small>'
+                    cicd_html += f'<br><span style="color: #4a5568;">{service.title}</span>'
+                    cicd_html += f'</div>'
+                    
+                    # Add screenshot if available
+                    if service.screenshot_file:
+                        screenshot_filename = Path(service.screenshot_file).name
+                        relative_path = f"screenshots/{screenshot_filename}"
+                        cicd_html += f'<img src="{relative_path}" class="screenshot" onclick="openModal(\'{relative_path}\')" alt="Screenshot" style="max-width: 80px; max-height: 60px;">'
+                    
+                    cicd_html += f'</div>'
+                    
+                    # Add vulnerabilities if any
+                    if service.vulnerabilities:
+                        cicd_html += f'<div style="margin-top: 10px;">'
+                        cicd_html += f'<span style="color: #e53e3e; font-weight: bold;">⚠️ Vulnerabilities:</span>'
+                        for vuln in service.vulnerabilities:
+                            cicd_html += f'<br><small style="color: #666;">• {vuln}</small>'
+                        cicd_html += f'</div>'
+                    
+                    cicd_html += f'</div>'
+                
+                cicd_html += f'</div>'
+            
+            cicd_html += '</div>'
         
-        # Use string replacement instead of format to avoid curly brace issues
-        html_content = html_template
-        html_content = html_content.replace('{scan_date}', scan_date)
-        html_content = html_content.replace('{total_services}', str(total_services))
-        html_content = html_content.replace('{service_types}', service_types)
-
-        html_content = html_content.replace('{https_count}', str(https_count))
-
-        html_content = html_content.replace('{lateral_movement_sections}', lateral_movement_sections)
-        html_content = html_content.replace('{discovered_paths_sections}', discovered_paths_sections)
-        html_content = html_content.replace('{table_rows}', table_rows)
-        html_content = html_content.replace('{subdomain_table}', subdomain_table)
+        # If no CI/CD or lateral movement targets found
+        if not cicd_targets and not lateral_targets:
+            cicd_html = '<div style="margin-bottom: 30px; background: #f7fafc; border-radius: 12px; padding: 20px; text-align: center;">'
+            cicd_html += '<h3 style="margin-bottom: 10px; color: #718096;">🎯 CI/CD & Lateral Movement Assets</h3>'
+            cicd_html += '<p style="color: #718096; font-style: italic;">No CI/CD or lateral movement targets detected during this scan.</p>'
+            cicd_html += '</div>'
         
-        return html_content
+        return cicd_html
     
     def save_results(self):
+        # Save CSV results
         csv_file = self.output_dir / "found_web.csv"
         with open(csv_file, 'w', newline='', encoding='utf-8') as f:
             if self.results:
@@ -1829,7 +2353,54 @@ for (var i = 0; i < pathsColl.length; i++) {
                         'discovered_paths': ', '.join(result.discovered_paths),
                         'domain_name': result.domain_name
                     })
+        
+        # Save scan summary
+        summary_file = self.output_dir / "scan_summary.txt"
+        with open(summary_file, 'w', encoding='utf-8') as f:
+            f.write("=" * 60 + "\n")
+            f.write("WEB DISCOVERY SCANNER - SCAN SUMMARY\n")
+            f.write("=" * 60 + "\n\n")
+            
+            f.write(f"Scan Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write(f"Scan Scope: {self.scan_scope}\n")
+            f.write(f"Scan Directory: {self.output_dir}\n\n")
+            
+            f.write(f"Total Services Found: {len(self.results)}\n")
+            
+            # Count different types of services
+            service_types = {}
+            https_services = 0
+            subdomain_services = 0
+            vulnerable_services = 0
+            
+            for service in self.results:
+                service_types[service.service_type] = service_types.get(service.service_type, 0) + 1
+                if service.protocol == 'https':
+                    https_services += 1
+                if service.is_subdomain:
+                    subdomain_services += 1
+                if service.vulnerabilities:
+                    vulnerable_services += 1
+            
+            f.write(f"HTTPS Services: {https_services}\n")
+            f.write(f"Subdomain Services: {subdomain_services}\n")
+            f.write(f"Vulnerable Services: {vulnerable_services}\n\n")
+            
+            f.write("Service Types Found:\n")
+            for service_type, count in service_types.items():
+                f.write(f"  - {service_type.title()}: {count}\n")
+            
+            f.write(f"\nFiles Generated:\n")
+            f.write(f"  - HTML Report: report.html\n")
+            f.write(f"  - CSV Results: found_web.csv\n")
+            f.write(f"  - Screenshots: screenshots/ directory\n")
+            f.write(f"  - This Summary: scan_summary.txt\n")
+            
+            f.write(f"\nScan completed successfully!\n")
+            f.write("=" * 60 + "\n")
+        
         logger.info(f"💾 Results saved to {self.output_dir}")
+        logger.info(f"📋 Scan summary saved to {summary_file}")
     
     async def run_scan(self, targets: List[str]):
         logger.info(f"🎯 Starting scan of {len(targets)} targets")
@@ -1849,84 +2420,130 @@ for (var i = 0; i < pathsColl.length; i++) {
         discovered_subdomains = set()
         scanned_combinations = set()  # Track target:port combinations to avoid duplicates
         
-        # First pass: scan main targets
+        # First pass: scan main targets with proper threading
         self.progress_tracker.update_status("Main targets", 0, "Starting main target scan...")
         
+        # Create all target:port combinations first
+        all_combinations = []
         for target in targets:
+            # Check kill switch before starting each target
+            if self.progress_tracker.should_kill():
+                logger.info(f"🛑 Kill switch activated - stopping scan")
+                break
+                
             ports = self.scan_ports(target)
             for port in ports:
+                # Check kill switch before each port
+                if self.progress_tracker.should_kill():
+                    logger.info(f"🛑 Kill switch activated - stopping scan")
+                    break
+                    
                 combination = f"{target}:{port}"
                 if combination in scanned_combinations:
                     self.progress_tracker.increment()
                     continue
                 
                 scanned_combinations.add(combination)
-                self.progress_tracker.update_status(target, port, "Checking service...")
+                all_combinations.append((target, port))
+        
+        # Process combinations in batches for better control
+        max_concurrent = self.config.get('threads', 30)
+        batch_size = max_concurrent
+        
+        for i in range(0, len(all_combinations), batch_size):
+            batch = all_combinations[i:i + batch_size]
+            
+            # Check kill switch before each batch
+            if self.progress_tracker.should_kill():
+                logger.info(f"🛑 Kill switch activated - stopping scan")
+                break
+            
+            # Create tasks for this batch
+            tasks = []
+            for target, port in batch:
+                task = self.process_target_port(target, port, discovered_subdomains)
+                tasks.append(task)
+            
+            # Execute batch concurrently
+            if tasks:
+                results = await asyncio.gather(*tasks, return_exceptions=True)
                 
-                # Check if user wants to skip
-                if self.progress_tracker.should_skip():
-                    logger.info(f"⏭️ Skipped {target}:{port}")
-                    self.progress_tracker.increment()
-                    continue
-                
-                try:
-                    result = await self.check_web_service(target, port)
-                    if result:
+                # Process results immediately
+                for result in results:
+                    if isinstance(result, Exception):
+                        logger.error(f"Task failed: {result}")
+                    elif result:
                         self.results.append(result)
-                        logger.info(f"🌐 Found web service: {target}:{port} ({result.protocol}) - {result.title} [{result.service_type}]")
-                        
-                        # Collect subdomains for recursive scanning (avoid duplicates)
-                        if self.config.get('recursive_scan', True):
-                            for subdomain in result.subdomains:
-                                if subdomain not in discovered_subdomains and subdomain != target:
-                                    discovered_subdomains.add(subdomain)
+                        logger.info(f"🌐 Found web service: {result.ip}:{result.port} ({result.protocol}) - {result.title} [{result.service_type}]")
                         
                         # Update HTML report after every discovery for live updates
                         self.generate_live_html_report()
-                    
-                except Exception as e:
-                    logger.error(f"Error processing {target}:{port} - {e}")
-                
-                self.progress_tracker.increment()
         
-        # Second pass: scan discovered subdomains (avoiding duplicates)
-        if self.config.get('recursive_scan', True) and discovered_subdomains:
+        # Check kill switch before subdomain scan
+        if self.progress_tracker.should_kill():
+            logger.info(f"🛑 Kill switch activated - stopping before subdomain scan")
+            return
+        
+        # Second pass: scan discovered subdomains (avoiding duplicates) with threading
+        if self.config.get('recursive_scan', True) and discovered_subdomains and not self.progress_tracker.should_kill():
             subdomain_list = list(discovered_subdomains)
             self.progress_tracker.update_status("Subdomains", 0, f"Starting subdomain scan of {len(subdomain_list)} subdomains...")
             
+            # Create all subdomain:port combinations first
+            subdomain_combinations = []
             for subdomain in subdomain_list:
+                # Check kill switch before each subdomain
+                if self.progress_tracker.should_kill():
+                    logger.info(f"🛑 Kill switch activated - stopping subdomain scan")
+                    break
+                    
                 ports = self.scan_ports(subdomain)
                 for port in ports:
+                    # Check kill switch before each port
+                    if self.progress_tracker.should_kill():
+                        logger.info(f"🛑 Kill switch activated - stopping subdomain scan")
+                        break
+                        
                     combination = f"{subdomain}:{port}"
                     if combination in scanned_combinations:
                         self.progress_tracker.increment()
                         continue
                     
                     scanned_combinations.add(combination)
-                    self.progress_tracker.update_status(subdomain, port, "Checking subdomain service...")
+                    subdomain_combinations.append((subdomain, port))
+            
+            # Process subdomain combinations in batches
+            for i in range(0, len(subdomain_combinations), batch_size):
+                batch = subdomain_combinations[i:i + batch_size]
+                
+                # Check kill switch before each batch
+                if self.progress_tracker.should_kill():
+                    logger.info(f"🛑 Kill switch activated - stopping subdomain scan")
+                    break
+                
+                # Create tasks for this batch
+                subdomain_tasks = []
+                for subdomain, port in batch:
+                    task = self.process_subdomain_port(subdomain, port)
+                    subdomain_tasks.append(task)
+                
+                # Execute batch concurrently
+                if subdomain_tasks:
+                    subdomain_results = await asyncio.gather(*subdomain_tasks, return_exceptions=True)
                     
-                    # Check if user wants to skip
-                    if self.progress_tracker.should_skip():
-                        logger.info(f"⏭️ Skipped subdomain {subdomain}:{port}")
-                        self.progress_tracker.increment()
-                        continue
-                    
-                    try:
-                        result = await self.check_web_service(subdomain, port)
-                        if result:
+                    # Process subdomain results immediately
+                    for result in subdomain_results:
+                        if isinstance(result, Exception):
+                            logger.error(f"Subdomain task failed: {result}")
+                        elif result:
                             # Mark as subdomain service
                             result.is_subdomain = True
-                            result.original_target = subdomain
+                            result.original_target = result.ip
                             self.results.append(result)
-                            logger.info(f"🔗 Found subdomain service: {subdomain}:{port} ({result.protocol}) - {result.title} [{result.service_type}]")
+                            logger.info(f"🔗 Found subdomain service: {result.ip}:{result.port} ({result.protocol}) - {result.title} [{result.service_type}]")
                             
                             # Update HTML report after every discovery for live updates
                             self.generate_live_html_report()
-                        
-                    except Exception as e:
-                        logger.error(f"Error processing subdomain {subdomain}:{port} - {e}")
-                    
-                    self.progress_tracker.increment()
         
         # Generate final HTML report
         self.progress_tracker.update_status("Finalizing", 0, "Generating final report...")
@@ -1981,6 +2598,10 @@ for (var i = 0; i < pathsColl.length; i++) {
         print(f"\n{Fore.GREEN}💾 Results saved to: {self.output_dir}{Style.RESET_ALL}")
         print(f"{Fore.BLUE}📄 HTML Report: {self.output_dir}/report.html{Style.RESET_ALL}")
         print(f"{Fore.CYAN}📊 CSV Report: {self.output_dir}/found_web.csv{Style.RESET_ALL}")
+        print(f"{Fore.YELLOW}📋 Scan Summary: {self.output_dir}/scan_summary.txt{Style.RESET_ALL}")
+        print(f"{Fore.MAGENTA}📸 Screenshots: {self.output_dir}/screenshots/{Style.RESET_ALL}")
+        print(f"{Fore.CYAN}{'='*60}{Style.RESET_ALL}")
+        print(f"{Fore.GREEN}📁 Organized output directory: {self.output_dir}{Style.RESET_ALL}")
         print(f"{Fore.CYAN}{'='*60}{Style.RESET_ALL}")
         
         logger.info(f"🎉 Scan completed! Found {len(self.results)} web services.")
@@ -2038,6 +2659,60 @@ for (var i = 0; i < pathsColl.length; i++) {
                 continue
         
         return discovered_paths
+    
+    async def process_target_port(self, target: str, port: int, discovered_subdomains: set):
+        """Process a single target:port combination"""
+        try:
+            self.progress_tracker.update_status(target, port, "Checking service...")
+            
+            # Check if user wants to skip
+            if self.progress_tracker.should_skip():
+                logger.info(f"⏭️ Skipped {target}:{port}")
+                self.progress_tracker.increment()
+                return None
+            
+            result = await self.check_web_service(target, port)
+            if result:
+                # Collect subdomains for recursive scanning (avoid duplicates)
+                if self.config.get('recursive_scan', True):
+                    for subdomain in result.subdomains:
+                        if subdomain not in discovered_subdomains and subdomain != target:
+                            discovered_subdomains.add(subdomain)
+                
+                self.progress_tracker.increment()
+                return result
+            else:
+                self.progress_tracker.increment()
+                return None
+                
+        except Exception as e:
+            logger.error(f"Error processing {target}:{port} - {e}")
+            self.progress_tracker.increment()
+            return None
+    
+    async def process_subdomain_port(self, subdomain: str, port: int):
+        """Process a single subdomain:port combination"""
+        try:
+            self.progress_tracker.update_status(subdomain, port, "Checking subdomain service...")
+            
+            # Check if user wants to skip
+            if self.progress_tracker.should_skip():
+                logger.info(f"⏭️ Skipped subdomain {subdomain}:{port}")
+                self.progress_tracker.increment()
+                return None
+            
+            result = await self.check_web_service(subdomain, port)
+            if result:
+                self.progress_tracker.increment()
+                return result
+            else:
+                self.progress_tracker.increment()
+                return None
+                
+        except Exception as e:
+            logger.error(f"Error processing subdomain {subdomain}:{port} - {e}")
+            self.progress_tracker.increment()
+            return None
 
 
 def main():
@@ -2108,6 +2783,18 @@ def main():
     
     input_type = 'input' if args.input else 'input_file'
     input_source = args.input or args.input_file
+    
+    # Add scan scope to config for organized output
+    if args.input:
+        # Extract scope from input (e.g., "10.130.234.0/24" -> "10.130.234.0_24")
+        scope = args.input.replace('/', '_').replace(':', '_').replace('.', '_')
+        config['scan_scope'] = scope
+    elif args.input_file:
+        # Use filename as scope
+        scope = Path(args.input_file).stem
+        config['scan_scope'] = scope
+    else:
+        config['scan_scope'] = 'unknown'
     
     scanner = WebDiscoveryScanner(config)
     targets = scanner.parse_input(input_source, input_type)
