@@ -1,80 +1,67 @@
-# 🌐 Web Discovery Scanner - Selfit
+<h1 align="center">🌐 Selfit — Web Discovery Scanner</h1>
 
-A powerful, feature-rich web service discovery and analysis tool designed for security professionals, penetration testers, and network administrators. This tool provides comprehensive web service enumeration with advanced features like SSL certificate analysis, subdomain discovery, path fuzzing, and automated screenshot capture.
+<p align="center">
+  <strong>Find every web service on a target, screenshot it, and tell you what's interesting.</strong><br>
+  Web service discovery + SSL analysis + subdomain enumeration + path fuzzing + default-cred testing — all in one Python CLI with a live HTML report.
+</p>
 
-## 🚀 Features
+<p align="center">
+  <img src="https://img.shields.io/github/stars/osherassor/selfit?style=for-the-badge&logo=github&color=ffd700" alt="Stars">
+  <img src="https://img.shields.io/github/last-commit/osherassor/selfit?style=for-the-badge&logo=git&color=00d4aa" alt="Last commit">
+  <img src="https://img.shields.io/badge/python-3.8%2B-3776ab?style=for-the-badge&logo=python&logoColor=white" alt="Python">
+  <img src="https://img.shields.io/badge/license-MIT-informational?style=for-the-badge" alt="License">
+</p>
 
-- **🌐 Web Service Discovery**: Automatically detects and analyzes web services on specified targets
-- **🔐 SSL/TLS Certificate Analysis**: Validates certificates, checks expiry dates, and extracts SANs
-- **📸 Automated Screenshots**: Captures high-quality screenshots of discovered web services
-- **🔗 Subdomain Enumeration**: Active and passive subdomain discovery from certificates
-- **🔍 Path Fuzzing**: Discovers hidden paths and files using customizable wordlists
-- **🔑 Credential Testing**: Tests default credentials with intelligent false-positive detection
-- **📊 Live HTML Reports**: Real-time HTML reports with interactive tables and collapsible sections
-- **🎯 DNS Resolution**: Reverse DNS lookup for IP addresses
-- **⚡ Performance Optimized**: Fast scanning with configurable threading and timeouts
-- **🎨 Beautiful UI**: Colored console output with emojis and progress bars
+---
 
-## 📋 Requirements
+## What is this?
 
-- Python 3.8 or higher
-- Windows, macOS, or Linux
-- Internet connection for initial setup
+You hand it a target — IP, hostname, CIDR, or a list — and it gives you back: every web service it found, screenshots, SSL cert details, discovered subdomains, fuzzed paths, default-cred hits, and a clean HTML report you can share. It's the "what's actually running on this perimeter?" answer in one shot.
 
-## 🛠️ Installation
-
-### 1. Clone the Repository
+## 🚀 Quick start
 
 ```bash
-git clone https://github.com/yourusername/web-discovery-scanner.git
-cd web-discovery-scanner
-```
-
-### 2. Install Python Dependencies
-
-```bash
+git clone https://github.com/osherassor/selfit
+cd selfit
 pip install -r requirements.txt
-```
-
-### 3. Install Playwright Browsers
-
-```bash
 playwright install chromium
-```
 
-### 4. Verify Installation
-
-```bash
-python web_discovery_scan.py --help
-```
-
-## 📖 Usage Examples
-
-### Basic Usage
-
-#### Scan a Single Target
-```bash
 python web_discovery_scan.py --input example.com --ports 80,443
 ```
 
-#### Scan Multiple Targets
+## ✨ Features
+
+- 🌐 **Service discovery** — finds and analyzes web services across your targets
+- 🔐 **SSL/TLS** — validates certs, checks expiry, extracts SANs
+- 📸 **Screenshots** — high-quality captures of every service (Playwright/Chromium)
+- 🔗 **Subdomain enum** — active + passive (cert-based)
+- 🔍 **Path fuzzing** — discovers hidden paths/files with custom wordlists
+- 🔑 **Default-cred testing** — with smart false-positive detection
+- 📊 **Live HTML report** — interactive, sortable, screenshots embedded
+- 🎯 **Reverse DNS** — auto for IP targets
+- ⚡ **Threaded** — configurable concurrency + timeouts
+- 🎨 **Colored CLI** — progress bars and live status
+
+## 📖 Usage examples
+
+### Basics
+
 ```bash
+# Single target
+python web_discovery_scan.py --input example.com --ports 80,443
+
+# Multiple
 python web_discovery_scan.py --input 192.168.1.1,192.168.1.2 --ports 80,443,8080
-```
 
-#### Scan a Subnet
-```bash
+# Whole subnet
 python web_discovery_scan.py --input 192.168.1.0/24 --ports 80,443
-```
 
-#### Scan from File
-```bash
+# From a file
 python web_discovery_scan.py --input-file targets.txt --ports 80,443
 ```
 
-### Advanced Usage
+### Full feature scan
 
-#### Full Feature Scan
 ```bash
 python web_discovery_scan.py \
   --input example.com \
@@ -85,7 +72,8 @@ python web_discovery_scan.py \
   --timeout 10
 ```
 
-#### Custom Wordlist for Path Fuzzing
+### Custom fuzzing wordlist
+
 ```bash
 python web_discovery_scan.py \
   --input example.com \
@@ -93,172 +81,101 @@ python web_discovery_scan.py \
   --fuzz-wordlist custom_paths.txt
 ```
 
-#### Disable Screenshots (Faster)
+### Faster — skip screenshots
+
 ```bash
-python web_discovery_scan.py \
-  --input example.com \
-  --no-screenshots
+python web_discovery_scan.py --input example.com --no-screenshots
 ```
 
-#### Custom Output Directory
-```bash
-python web_discovery_scan.py \
-  --input example.com \
-  --output my_scan_results
-```
+## 🔧 CLI reference
 
-## 🔧 Command Line Options
+### Input
+- `--input` — single IP / hostname / CIDR
+- `--input-file` — file with one target per line
 
-### Input Options
-- `--input`: Single IP/hostname/CIDR range
-- `--input-file`: File containing targets (one per line)
+### Ports
+- `--ports` — comma-separated. Default: `80,443,8080,8000,8443,8888,81,82,7000,9443`
 
-### Port Configuration
-- `--ports`: Comma-separated list of ports (default: 80,443,8080,8000,8443,8888,81,82,7000,9443)
+### Performance
+- `--threads` — concurrent threads (default 30)
+- `--timeout` — connect timeout in seconds (default 5)
 
-### Performance Options
-- `--threads`: Number of concurrent threads (default: 30)
-- `--timeout`: Connection timeout in seconds (default: 5)
+### Feature flags
+- `--enable-fuzzing` — turn on path fuzzing
+- `--fuzz-wordlist` — custom wordlist
+- `--creds-check` — default-credential testing
+- `--creds-file` — custom `username:password` file
+- `--subdomain-enum` / `--no-subdomain-enum` — control active subdomain enum (on by default)
+- `--no-recursive` — don't recurse discovered subdomains
 
-### Feature Flags
-- `--enable-fuzzing`: Enable path fuzzing discovery
-- `--fuzz-wordlist`: Custom wordlist file for path fuzzing
-- `--creds-check`: Enable default credential testing
-- `--creds-file`: Custom credentials file (username:password format)
-- `--subdomain-enum`: Enable active subdomain enumeration (enabled by default)
-- `--no-subdomain-enum`: Disable active subdomain enumeration
-- `--no-recursive`: Disable recursive scanning of discovered subdomains
+### Output
+- `--output` — output dir (default `outputs`)
+- `--no-screenshots` — disable screenshot capture
+- `--no-html` — disable HTML report
 
-### Output Options
-- `--output`: Output directory (default: outputs)
-- `--no-screenshots`: Disable screenshot capture
-- `--no-html`: Disable HTML report generation
-
-## 📁 Output Structure
+## 📁 Output structure
 
 ```
 outputs/
-├── report.html          # Interactive HTML report
-├── found_web.csv        # CSV export of results
-└── screenshots/         # Captured screenshots
+├── report.html          # interactive report
+├── found_web.csv        # CSV export
+└── screenshots/
     ├── target1_443_https.png
     ├── target2_80_http.png
     └── ...
 ```
 
-## 📊 HTML Report Features
+## 📊 What's in the HTML report
 
-The generated HTML report includes:
+- 📈 **Summary stats** — total services, HTTPS count, service types
+- 🎯 **Target info** — original targets + discovered subdomains
+- 🔑 **Credential findings** — default creds that worked
+- 📋 **Sortable, searchable tables**
+- 🖼️ **Screenshot gallery** — click to enlarge
+- 📄 **Per-service detail** — headers, cookies, certs, discovered paths
+- 🔍 **Collapsible sections** — keep things tidy
 
-- **📈 Summary Statistics**: Total services, HTTPS count, service types
-- **🎯 Target Information**: Original scan targets and discovered subdomains
-- **🔑 Credential Findings**: Default credentials discovered during scan
-- **📋 Interactive Tables**: Sortable and searchable results
-- **🖼️ Screenshot Gallery**: Click to enlarge screenshots
-- **📄 Detailed Information**: Headers, cookies, certificates, discovered paths
-- **🔍 Collapsible Sections**: Organized information display
+## 🔍 Default fuzzing wordlist covers
 
-## 🔍 Path Fuzzing
+- 🛂 **Admin** — `/admin`, `/login`, `/auth`, `/management`
+- 🌐 **API** — `/api`, `/api/v1`, `/api/v2`, `/rest`
+- 📜 **Common files** — `/robots.txt`, `/sitemap.xml`, `/.env`
+- 💾 **Backups** — `/backup`, `/bak`, `/old`
+- 🧪 **Dev** — `/dev`, `/test`, `/staging`, `/debug`
 
-The tool includes a comprehensive default wordlist covering:
+## 🔑 Default-cred testing
 
-- **Admin Panels**: `/admin`, `/login`, `/auth`, `/management`
-- **API Endpoints**: `/api`, `/api/v1`, `/api/v2`, `/rest`
-- **Common Files**: `/robots.txt`, `/sitemap.xml`, `/.env`
-- **Backup Files**: `/backup`, `/backups`, `/bak`, `/old`
-- **Development**: `/dev`, `/test`, `/staging`, `/debug`
+Tests common combos (`admin:admin`, `admin:password`, `root:root`, `user:user`, `guest:guest`, …) using diffing between with/without-creds responses to suppress false positives.
 
-## 🔑 Credential Testing
+## 🤝 Pairs well with
 
-Tests common default credentials:
+- 📚 **[AwesomeWL](https://github.com/osherassor/AwesomeWL)** — feed `web-application/Common_list.txt` to `--fuzz-wordlist`, and `subdomains/subdomains.txt` to your subdomain enum step. They're built for this.
+- 🧰 **[MyCyberTool](https://github.com/osherassor/MyCyberTool)** — once selfit gives you a service URL, take it to MyCyberTool for headers / CORS / TLS / 403-bypass checks.
+- 🧪 **[passive-pentest-profiler](https://github.com/osherassor/passive-pentest-profiler)** — open the discovered service in Chrome with the profiler installed for the passive deep-dive (cookies, JWTs, secrets in JS).
 
-- `admin:admin`
-- `admin:password`
-- `root:root`
-- `user:user`
-- `guest:guest`
-- And more...
-
-Uses intelligent detection to minimize false positives by comparing responses with and without credentials.
-
-## 🛡️ Security Features
-
-- **SSL Certificate Validation**: Checks expiry dates and validity
-- **Server Information Disclosure**: Identifies exposed server banners
-- **Missing Security Headers**: Detects common security misconfigurations
-- **Default Credential Detection**: Tests for common weak credentials
-
-## 📝 Example Output
-
-```
-======================================================================
-🚀 WEB DISCOVERY SCANNER - ENHANCED VERSION
-======================================================================
-🔍 Features:
-  🌐 Web service discovery and analysis
-  🔐 SSL/TLS certificate validation
-  📸 Automated screenshots
-  🔗 Subdomain enumeration
-  🔍 Path fuzzing and discovery
-  📊 Live HTML reports
-  🎯 CI/CD and lateral movement detection
-======================================================================
-
-🎯 Starting scan of 3 targets
-🚀 Starting Web Discovery Scanner
-📊 Targets: 3 | Ports: 1 | Total Tasks: 3
-⏱️  Estimated time: 9s
-⌨️  Press 's' to skip current website scan
-
-🔍 Scanning: 100%|██████████| 3/3 [00:15<00:00, 5.12s/target:port]
-
-✅ Scan completed!
-
-============================================================
-📊 SCAN SUMMARY
-============================================================
-✅ Total Services Found: 3
-🔗 Subdomain Services: 1
-🔐 HTTPS Services: 3
-
-🔍 Service Types Found:
-  🌐 Web: 3
-
-💾 Results saved to: outputs
-📄 HTML Report: outputs/report.html
-📊 CSV Report: outputs/found_web.csv
-============================================================
+```bash
+# Common combo
+curl -sO https://raw.githubusercontent.com/osherassor/AwesomeWL/main/web-application/Common_list.txt
+python web_discovery_scan.py --input example.com --enable-fuzzing --fuzz-wordlist Common_list.txt
 ```
 
-## 🚨 Important Notes
+## 🛠️ Requirements
 
-- **Legal Use Only**: This tool is for authorized security testing only
-- **Rate Limiting**: Be respectful of target systems and implement appropriate delays
-- **SSL Warnings**: The tool ignores SSL certificate errors for comprehensive scanning
-- **Resource Usage**: Screenshot capture can be resource-intensive
+- Python 3.8+
+- Windows / macOS / Linux
+- Playwright Chromium
 
-## 🤝 Contributing
+## 🚨 Notes
 
-1. Fork the repository
-2. Create a feature branch (`git checkout -b feature/amazing-feature`)
-3. Commit your changes (`git commit -m 'Add amazing feature'`)
-4. Push to the branch (`git push origin feature/amazing-feature`)
-5. Open a Pull Request
+- ⚖️ **Authorized targets only**
+- 🐢 **Be respectful** — tune `--threads` / `--timeout` to the target's tolerance
+- 🔓 **SSL errors are ignored** for scanning coverage
+- 🐏 **Screenshots are RAM-hungry** — use `--no-screenshots` on big sweeps
 
 ## 📄 License
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
-
-## ⚠️ Disclaimer
-
-This tool is provided for educational and authorized security testing purposes only. Users are responsible for ensuring they have proper authorization before scanning any systems. The authors are not responsible for any misuse of this tool.
-
-## 🆘 Support
-
-- **Issues**: Report bugs and feature requests via GitHub Issues
-- **Documentation**: Check the inline help with `python web_discovery_scan.py --help`
-- **Examples**: See the usage examples above
+MIT
 
 ---
 
-**Made with ❤️ for the security community** 
+<p align="center"><sub>Made for the security community.</sub></p>
